@@ -5,11 +5,11 @@ import argparse, json, math, os, sys, tempfile, traceback, contextlib, io, struc
 from collections import defaultdict
 from pathlib import Path
 
-D = Path(r"E:\SD\Lora\krea2")
+D = Path(r"C:\Lora\krea2")
 DEFAULT_INPUTS = [
-    D / "Krea2_TextFusion_Refusal_Reduction_v2_SVD_r17.safetensors",
-    D / "AltGirlKreaV1.5_k_AltG1rl_SVD_r14.safetensors",
-    D / "RealisticGoodGirlKrea2_krea2_k_rggl_SVD_r14.safetensors",
+    D / "lora1.safetensors",
+    D / "lora2.safetensors",
+    D / "lora3.safetensors",
 ]
 DEFAULT_OUTPUT = D / "Krea2_Merged_3x_SVD_r32_v3.safetensors"
 A_SUFFIXES = (".lora_A.default.weight", ".lora_down.weight", ".lora_A.weight", ".lora_A.default", ".lora_A")
@@ -33,43 +33,43 @@ def inspect_lora_header(path):
     """Fast, CPU-only SafeTensors structural check; does not load tensor payloads."""
     path = Path(path)
     if not path.is_file():
-        raise FileNotFoundError(f"Файл не найден: {path}")
+        raise FileNotFoundError(f"File nont found: {path}")
     if path.suffix.lower() != ".safetensors":
-        raise ValueError("Поддерживаются только файлы .safetensors.")
+        raise ValueError("Only .safetensors file.")
     size = path.stat().st_size
     with path.open("rb") as f:
         prefix = f.read(8)
         if len(prefix) != 8:
-            raise ValueError("Файл слишком короткий: нет заголовка SafeTensors.")
+            raise ValueError("File too short: no SafeTensors structure.")
         n = struct.unpack("<Q", prefix)[0]
         if n < 2 or n > MAX_HEADER_BYTES or 8 + n > size:
-            raise ValueError(f"Недопустимая длина заголовка SafeTensors: {n} байт.")
+            raise ValueError(f"Header of SafeTensors file error: {n} bytes.")
         raw = f.read(n)
     try:
         header = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        raise ValueError(f"Не удалось прочитать JSON-заголовок: {exc}") from exc
+        raise ValueError(f"JSON header  not readed: {exc}") from exc
     if not isinstance(header, dict):
-        raise ValueError("Неверная структура заголовка SafeTensors.")
+        raise ValueError("Wrong header SafeTensors.")
 
     metadata = header.get("__metadata__", {})
     if not isinstance(metadata, dict):
-        raise ValueError("Поле __metadata__ имеет неверный формат.")
+        raise ValueError("__metadata__ wrong format.")
 
     tensors = {}
     for key, item in header.items():
         if key == "__metadata__":
             continue
         if not isinstance(key, str) or not isinstance(item, dict):
-            raise ValueError("В заголовке обнаружена некорректная запись тензора.")
+            raise ValueError("Header wrong safetensor.")
         shape, dtype = item.get("shape"), item.get("dtype")
         offsets = item.get("data_offsets")
         if not isinstance(shape, list) or not all(isinstance(x, int) and x >= 0 for x in shape):
-            raise ValueError(f"Некорректная shape у тензора: {key}")
+            raise ValueError(f"Incorrect shape: {key}")
         if not isinstance(dtype, str) or not isinstance(offsets, list) or len(offsets) != 2:
-            raise ValueError(f"Неполное описание тензора в заголовке: {key}")
+            raise ValueError(f"Wrong safetensor header: {key}")
         if not all(isinstance(x, int) for x in offsets) or offsets[0] < 0 or offsets[1] < offsets[0] or 8 + n + offsets[1] > size:
-            raise ValueError(f"Некорректные data_offsets у тензора: {key}")
+            raise ValueError(f"Incorrect data_offsets: {key}")
         tensors[key] = {"shape": tuple(shape), "dtype": dtype}
 
     mods, unknown = defaultdict(dict), []
@@ -80,37 +80,37 @@ def inspect_lora_header(path):
             continue
         kind, stem, suffix = parsed
         if kind in mods[stem]:
-            raise ValueError(f"Дублируется компонент {kind} для слоя {stem}.")
+            raise ValueError(f"Dublicate {kind} for layer {stem}.")
         mods[stem][kind] = info
         mods[stem][kind + "_suffix"] = suffix
 
     errors = []
     if unknown:
-        errors.append("Нераспознанные тензоры (программа не будет их отбрасывать): " + ", ".join(unknown[:8]))
+        errors.append("Incorrect tensors: " + ", ".join(unknown[:8]))
     if not mods:
-        errors.append("Не найдено ни одной поддерживаемой пары LoRA A/B.")
+        errors.append("Not found LoRA A/B.")
     ranks, dtypes = set(), set()
     for stem, m in mods.items():
         if "A" not in m or "B" not in m:
-            errors.append(f"Неполная пара A/B: {stem}")
+            errors.append(f"Incorrect A/B: {stem}")
             continue
         ash, bsh = m["A"]["shape"], m["B"]["shape"]
         if len(ash) != 2 or len(bsh) != 2 or ash[0] != bsh[1] or ash[0] < 1:
-            errors.append(f"Неверные формы A/B у {stem}: A={ash}, B={bsh}")
+            errors.append(f"Wrong shape A/B in {stem}: A={ash}, B={bsh}")
             continue
         ranks.add(ash[0]); dtypes.update((m["A"]["dtype"], m["B"]["dtype"]))
         if "alpha" in m and len(m["alpha"]["shape"]) > 1:
-            errors.append(f"Alpha не скалярный у слоя {stem}: {m['alpha']['shape']}")
+            errors.append(f"Alpha wrong layer {stem}: {m['alpha']['shape']}")
 
     if errors:
         raise ValueError("\n".join(errors))
     warnings = []
     if not metadata.get("modelspec.architecture"):
-        warnings.append("В метаданных нет modelspec.architecture.")
+        warnings.append("Metadata incorrect modelspec.architecture.")
     if not (metadata.get("ss_base_model_version") or metadata.get("ss_base_model")):
-        warnings.append("В метаданных не указана базовая модель.")
+        warnings.append("Metadata wrong.")
     if len(ranks) > 1:
-        warnings.append("Внутри LoRA используются разные ранги: " + ", ".join(map(str, sorted(ranks))))
+        warnings.append("In LoRA used wrong rang: " + ", ".join(map(str, sorted(ranks))))
     return {"path": path, "metadata": metadata, "modules": mods,
             "tensor_count": len(tensors), "module_count": len(mods),
             "ranks": sorted(ranks), "dtypes": sorted(dtypes), "warnings": warnings}
@@ -122,7 +122,7 @@ def compare_lora_headers(new_info, existing_infos):
     for old in existing_infos:
         shared = set(new_info["modules"]) & set(old["modules"])
         if not shared:
-            warnings.append(f"Нет общих целевых слоёв с {old['path'].name}.")
+            warnings.append(f"Not shared layers with {old['path'].name}.")
             continue
         bad = []
         for stem in shared:
@@ -131,17 +131,17 @@ def compare_lora_headers(new_info, existing_infos):
                 bad.append(stem)
         if bad:
             raise ValueError(
-                f"Несовместимые размеры с {old['path'].name}: {len(bad)} общих слоёв.\n" +
-                "Первые несовпадения: " + ", ".join(bad[:6])
+                f"Incorrect size {old['path'].name}: {len(bad)} общих слоёв.\n" +
+                "First wrong size: " + ", ".join(bad[:6])
             )
         ma, mb = new_info["metadata"], old["metadata"]
         aa, ab = ma.get("modelspec.architecture"), mb.get("modelspec.architecture")
         ba = ma.get("ss_base_model_version") or ma.get("ss_base_model")
         bb = mb.get("ss_base_model_version") or mb.get("ss_base_model")
         if aa and ab and aa != ab:
-            warnings.append(f"Архитектуры в метаданных различаются с {old['path'].name}: {aa} / {ab}.")
+            warnings.append(f"Wrong metadata {old['path'].name}: {aa} / {ab}.")
         if ba and bb and ba != bb:
-            warnings.append(f"Базовые модели в метаданных различаются с {old['path'].name}: {ba} / {bb}.")
+            warnings.append(f"Base model not't correct with {old['path'].name}: {ba} / {bb}.")
     return warnings
 
 
@@ -355,7 +355,7 @@ class Krea2MergerGUI:
         ttk.Button(controls, text="Add files…", command=self.add_input_files).pack(fill=tk.X, pady=2)
         ttk.Button(controls, text="Remove selected", command=self.remove_input).pack(fill=tk.X, pady=2)
         ttk.Button(controls, text="Clear all", command=self.clear_inputs).pack(fill=tk.X, pady=2)
-        ttk.Label(controls, text="Проверка структуры\nперед добавлением", justify="center").pack(fill=tk.X, pady=(10, 2))
+        ttk.Label(controls, text="Check \nbefore adding", justify="center").pack(fill=tk.X, pady=(10, 2))
 
         weights = ttk.LabelFrame(outer, text="Merge coefficients", padding=8)
         weights.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -423,16 +423,16 @@ class Krea2MergerGUI:
                 warnings = info["warnings"] + cross_warnings
                 if warnings:
                     details = (
-                        f"Файл: {Path(raw_path).name}\n"
-                        f"Тензоров: {info['tensor_count']}\n"
-                        f"Слоёв LoRA: {info['module_count']}\n"
-                        f"Ранги: {info['ranks']}\n"
-                        f"Типы данных: {', '.join(info['dtypes']) or 'не определены'}\n\n"
-                        "Предупреждения:\n• " + "\n• ".join(warnings) +
-                        "\n\nДобавить файл несмотря на предупреждения?"
+                        f"File: {Path(raw_path).name}\n"
+                        f"Tensors: {info['tensor_count']}\n"
+                        f"Layers LoRA: {info['module_count']}\n"
+                        f"Ranks: {info['ranks']}\n"
+                        f"Data type: {', '.join(info['dtypes']) or 'не определены'}\n\n"
+                        "Warnings:\n• " + "\n• ".join(warnings) +
+                        "\n\nAdd file?"
                     )
-                    if not messagebox.askyesno("LoRA проверена с предупреждениями", details, parent=self.root):
-                        rejected.append(Path(raw_path).name + " (отклонена пользователем)")
+                    if not messagebox.askyesno("LoRA check with warnings", details, parent=self.root):
+                        rejected.append(Path(raw_path).name + " (user refusal)")
                         continue
                 self.input_files.append(raw_path)
                 self.weight_vars.append(tk.StringVar(value="1.0"))
@@ -441,18 +441,18 @@ class Krea2MergerGUI:
             except Exception as exc:
                 rejected.append(Path(raw_path).name + f" — {exc}")
                 messagebox.showerror(
-                    "LoRA не прошла проверку",
-                    f"Файл не добавлен в список:\n{Path(raw_path).name}\n\n{exc}\n\n"
-                    "Проверка читает только заголовок SafeTensors. Исходный файл не изменяется.",
+                    "LoRA incorrect",
+                    f"File don't added to list:\n{Path(raw_path).name}\n\n{exc}\n\n"
+                    "Checking only SafeTensors. File don't saved.",
                     parent=self.root,
                 )
         self.refresh_inputs()
         if added:
-            self.status.set(f"Добавлено после проверки: {len(added)}")
+            self.status.set(f"Added after check: {len(added)}")
         elif not paths:
             return
         elif rejected:
-            self.status.set(f"Не добавлено: {len(rejected)}")
+            self.status.set(f"Don't added: {len(rejected)}")
 
     def refresh_inputs(self):
         self.input_listbox.delete(0, tk.END)
