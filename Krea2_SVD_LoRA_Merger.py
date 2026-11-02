@@ -1,9 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Krea2 SVD LoRA Merger v3: CPU merge, QR + small-core SVD, atomic save."""
+"""Krea2 SVD LoRA Merger v4: CPU merge, QR + small-core SVD, atomic save."""
 import argparse, json, math, os, sys, tempfile, traceback, contextlib, io, struct
+import threading
 from collections import defaultdict
 from pathlib import Path
+
+# GUI dependencies are optional: the command-line mode works without tkinter.
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    HAVE_TK = True
+except ImportError:
+    tk = ttk = filedialog = messagebox = None
+    HAVE_TK = False
 
 D = Path(r"C:\Lora\krea2")
 DEFAULT_INPUTS = [
@@ -16,26 +26,32 @@ A_SUFFIXES = (".lora_A.default.weight", ".lora_down.weight", ".lora_A.weight", "
 B_SUFFIXES = (".lora_B.default.weight", ".lora_up.weight", ".lora_B.weight", ".lora_B.default", ".lora_B")
 ALPHA_SUFFIXES = (".lora_alpha", ".alpha")
 
+
 def args_parse():
     p = argparse.ArgumentParser(description="Merge Krea2 LoRAs and SVD-repack to a uniform rank.")
     p.add_argument("--inputs", nargs="+", default=[str(x) for x in DEFAULT_INPUTS])
     p.add_argument("--output", default=str(DEFAULT_OUTPUT))
-    p.add_argument("--weights", nargs="+", type=float, default=[1.0, 1.0, 1.0])
+    p.add_argument("--weights", nargs="+", type=float, default=None,
+                   help="one coefficient per input (default: 1.0 for every input)")
     p.add_argument("--target-rank", type=int, default=32)
     p.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--no-pause", action="store_true",
+                   help="do not wait for Enter after an error (for scripts and .bat files)")
     return p.parse_args()
 
+
 MAX_HEADER_BYTES = 256 * 1024 * 1024
+
 
 def inspect_lora_header(path):
     """Fast, CPU-only SafeTensors structural check; does not load tensor payloads."""
     path = Path(path)
     if not path.is_file():
-        raise FileNotFoundError(f"File nont found: {path}")
+        raise FileNotFoundError(f"File not found: {path}")
     if path.suffix.lower() != ".safetensors":
-        raise ValueError("Only .safetensors file.")
+        raise ValueError("Only .safetensors files are supported.")
     size = path.stat().st_size
     with path.open("rb") as f:
         prefix = f.read(8)
@@ -43,31 +59,31 @@ def inspect_lora_header(path):
             raise ValueError("File too short: no SafeTensors structure.")
         n = struct.unpack("<Q", prefix)[0]
         if n < 2 or n > MAX_HEADER_BYTES or 8 + n > size:
-            raise ValueError(f"Header of SafeTensors file error: {n} bytes.")
+            raise ValueError(f"Invalid SafeTensors header size: {n} bytes.")
         raw = f.read(n)
     try:
         header = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        raise ValueError(f"JSON header  not readed: {exc}") from exc
+        raise ValueError(f"Could not read JSON header: {exc}") from exc
     if not isinstance(header, dict):
-        raise ValueError("Wrong header SafeTensors.")
+        raise ValueError("Invalid SafeTensors header.")
 
     metadata = header.get("__metadata__", {})
     if not isinstance(metadata, dict):
-        raise ValueError("__metadata__ wrong format.")
+        raise ValueError("__metadata__ has the wrong format.")
 
     tensors = {}
     for key, item in header.items():
         if key == "__metadata__":
             continue
         if not isinstance(key, str) or not isinstance(item, dict):
-            raise ValueError("Header wrong safetensor.")
+            raise ValueError("Invalid tensor entry in SafeTensors header.")
         shape, dtype = item.get("shape"), item.get("dtype")
         offsets = item.get("data_offsets")
         if not isinstance(shape, list) or not all(isinstance(x, int) and x >= 0 for x in shape):
             raise ValueError(f"Incorrect shape: {key}")
         if not isinstance(dtype, str) or not isinstance(offsets, list) or len(offsets) != 2:
-            raise ValueError(f"Wrong safetensor header: {key}")
+            raise ValueError(f"Invalid tensor header entry: {key}")
         if not all(isinstance(x, int) for x in offsets) or offsets[0] < 0 or offsets[1] < offsets[0] or 8 + n + offsets[1] > size:
             raise ValueError(f"Incorrect data_offsets: {key}")
         tensors[key] = {"shape": tuple(shape), "dtype": dtype}
@@ -80,40 +96,43 @@ def inspect_lora_header(path):
             continue
         kind, stem, suffix = parsed
         if kind in mods[stem]:
-            raise ValueError(f"Dublicate {kind} for layer {stem}.")
+            raise ValueError(f"Duplicate {kind} for layer {stem}.")
         mods[stem][kind] = info
         mods[stem][kind + "_suffix"] = suffix
 
     errors = []
     if unknown:
-        errors.append("Incorrect tensors: " + ", ".join(unknown[:8]))
+        errors.append("Unrecognized tensors: " + ", ".join(unknown[:8]))
     if not mods:
-        errors.append("Not found LoRA A/B.")
+        errors.append("No LoRA A/B tensors found.")
     ranks, dtypes = set(), set()
     for stem, m in mods.items():
         if "A" not in m or "B" not in m:
-            errors.append(f"Incorrect A/B: {stem}")
+            errors.append(f"Incomplete A/B pair: {stem}")
             continue
         ash, bsh = m["A"]["shape"], m["B"]["shape"]
         if len(ash) != 2 or len(bsh) != 2 or ash[0] != bsh[1] or ash[0] < 1:
-            errors.append(f"Wrong shape A/B in {stem}: A={ash}, B={bsh}")
+            errors.append(f"Wrong A/B shapes in {stem}: A={ash}, B={bsh}")
             continue
         ranks.add(ash[0]); dtypes.update((m["A"]["dtype"], m["B"]["dtype"]))
         if "alpha" in m and len(m["alpha"]["shape"]) > 1:
-            errors.append(f"Alpha wrong layer {stem}: {m['alpha']['shape']}")
+            errors.append(f"Invalid alpha shape in layer {stem}: {m['alpha']['shape']}")
 
     if errors:
         raise ValueError("\n".join(errors))
-    warnings = []
+
+    # "warnings" need a user decision; "notes" are informational only.
+    warnings, notes = [], []
     if not metadata.get("modelspec.architecture"):
-        warnings.append("Metadata incorrect modelspec.architecture.")
+        notes.append("Metadata has no modelspec.architecture.")
     if not (metadata.get("ss_base_model_version") or metadata.get("ss_base_model")):
-        warnings.append("Metadata wrong.")
+        notes.append("Metadata has no base model information.")
     if len(ranks) > 1:
-        warnings.append("In LoRA used wrong rang: " + ", ".join(map(str, sorted(ranks))))
+        notes.append("Layers use different ranks: " + ", ".join(map(str, sorted(ranks))))
     return {"path": path, "metadata": metadata, "modules": mods,
             "tensor_count": len(tensors), "module_count": len(mods),
-            "ranks": sorted(ranks), "dtypes": sorted(dtypes), "warnings": warnings}
+            "ranks": sorted(ranks), "dtypes": sorted(dtypes),
+            "warnings": warnings, "notes": notes}
 
 
 def compare_lora_headers(new_info, existing_infos):
@@ -122,7 +141,7 @@ def compare_lora_headers(new_info, existing_infos):
     for old in existing_infos:
         shared = set(new_info["modules"]) & set(old["modules"])
         if not shared:
-            warnings.append(f"Not shared layers with {old['path'].name}.")
+            warnings.append(f"No shared layers with {old['path'].name}.")
             continue
         bad = []
         for stem in shared:
@@ -131,17 +150,17 @@ def compare_lora_headers(new_info, existing_infos):
                 bad.append(stem)
         if bad:
             raise ValueError(
-                f"Incorrect size {old['path'].name}: {len(bad)} общих слоёв.\n" +
-                "First wrong size: " + ", ".join(bad[:6])
+                f"Dimension mismatch with {old['path'].name}: {len(bad)} shared layers.\n" +
+                "First mismatching layers: " + ", ".join(bad[:6])
             )
         ma, mb = new_info["metadata"], old["metadata"]
         aa, ab = ma.get("modelspec.architecture"), mb.get("modelspec.architecture")
         ba = ma.get("ss_base_model_version") or ma.get("ss_base_model")
         bb = mb.get("ss_base_model_version") or mb.get("ss_base_model")
         if aa and ab and aa != ab:
-            warnings.append(f"Wrong metadata {old['path'].name}: {aa} / {ab}.")
+            warnings.append(f"Architecture differs from {old['path'].name}: {aa} / {ab}.")
         if ba and bb and ba != bb:
-            warnings.append(f"Base model not't correct with {old['path'].name}: {ba} / {bb}.")
+            warnings.append(f"Base model differs from {old['path'].name}: {ba} / {bb}.")
     return warnings
 
 
@@ -151,6 +170,7 @@ def parse_key(key):
             if key.endswith(s):
                 return kind, key[:-len(s)], s
     return None
+
 
 def load_lora(path, torch, load_file):
     raw = load_file(str(path), device="cpu")
@@ -181,6 +201,7 @@ def load_lora(path, torch, load_file):
         m["rank"] = int(A.shape[0])
     return mods
 
+
 def repack(A_cat, B_cat, target_rank, torch):
     # B=Qb Rb and A.T=Qa Ra, so BA=Qb (Rb Ra.T) Qa.T.
     A, B = A_cat.float(), B_cat.float()
@@ -201,10 +222,13 @@ def repack(A_cat, B_cat, target_rank, torch):
     err = 0.0 if float(norm.item()) == 0 else float((torch.linalg.vector_norm(S[k:]) / norm).item())
     return Aout, Bout, err, int(S.numel())
 
+
 def merge_loras(args=None):
     if args is None:
         args = args_parse()
     if not args.inputs: raise ValueError("At least one input is required.")
+    if getattr(args, "weights", None) is None:
+        args.weights = [1.0] * len(args.inputs)
     if len(args.weights) != len(args.inputs): raise ValueError("Supply exactly one --weights value per input.")
     if args.target_rank < 1: raise ValueError("--target-rank must be >= 1.")
     if not all(math.isfinite(w) for w in args.weights): raise ValueError("Weights must be finite.")
@@ -216,18 +240,30 @@ def merge_loras(args=None):
     if output.resolve() in {p.resolve() for p in inputs}: raise ValueError("Output cannot overwrite an input.")
     missing = [str(p) for p in inputs if not p.is_file()]
     if missing: raise FileNotFoundError("Missing input(s):\n  " + "\n  ".join(missing))
-    if output.exists() and not args.overwrite:
+    # A dry run never writes anything, so an existing output file is not a problem there.
+    if output.exists() and not args.overwrite and not args.dry_run:
         raise FileExistsError(f"Output exists: {output}. Choose another --output or pass --overwrite.")
-    print("Krea2 SVD LoRA Merger v3 — CPU preflight + uniform-rank SVD")
+    print("Krea2 SVD LoRA Merger v4 — CPU preflight + uniform-rank SVD")
     print(f"Target rank={args.target_rank}; dtype={args.dtype}; sources remain read-only.")
     for p, w in zip(inputs, args.weights): print(f"  {p.name}  coefficient={w:g}")
     print(f"Output: {output}\n")
     allmods, metadatas = [], []
     for p in inputs:
-        mods = load_lora(p, torch, load_file)
         with safe_open(str(p), framework="pt", device="cpu") as sf: md = sf.metadata() or {}
+        mods = load_lora(p, torch, load_file)
         allmods.append(mods); metadatas.append(md)
         print(f"Read {p.name}: {len(mods)} modules; architecture={md.get('modelspec.architecture','unspecified')}; base={md.get('ss_base_model_version','unspecified')}")
+        # Without alpha tensors the scale is assumed to be 1 (alpha = rank). Warn if metadata disagrees.
+        no_alpha_ranks = {m["rank"] for m in mods.values() if "alpha" not in m}
+        meta_alpha = md.get("ss_network_alpha")
+        if no_alpha_ranks and meta_alpha is not None:
+            try:
+                meta_alpha = float(meta_alpha)
+            except (TypeError, ValueError):
+                meta_alpha = None
+            if meta_alpha is not None and any(abs(meta_alpha - r) > 1e-9 for r in no_alpha_ranks):
+                print(f"  WARNING: {p.name} has no alpha tensors, so scale 1 (alpha = rank) is assumed, "
+                      f"but metadata says ss_network_alpha={meta_alpha:g}. The contribution may be scaled incorrectly.")
     for i in range(len(inputs)):
         for j in range(i+1, len(inputs)):
             left, right = set(allmods[i]), set(allmods[j])
@@ -308,10 +344,22 @@ def merge_loras(args=None):
     print("Saved file was reopened and validated before atomic replacement.")
     print("All original LoRAs remain untouched. Test in Forge Neo at low strength first.")
 
-# GUI dependencies are used only when launched without command-line arguments.
-import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+
+class _GuiStream(io.TextIOBase):
+    """File-like object that forwards everything written to it (print output) to a callback."""
+    def __init__(self, emit):
+        self._emit = emit
+
+    def writable(self):
+        return True
+
+    def write(self, s):
+        if s:
+            self._emit(s)
+        return len(s)
+
+    def flush(self):
+        pass
 
 
 class Krea2MergerGUI:
@@ -329,8 +377,11 @@ class Krea2MergerGUI:
         self.dtype = tk.StringVar(value="bf16")
         self.overwrite = tk.BooleanVar(value=False)
         self.dry_run = tk.BooleanVar(value=False)
+        self.running = False
+        self.closing = False
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self):
         outer = ttk.Frame(self.root, padding=12)
@@ -355,7 +406,7 @@ class Krea2MergerGUI:
         ttk.Button(controls, text="Add files…", command=self.add_input_files).pack(fill=tk.X, pady=2)
         ttk.Button(controls, text="Remove selected", command=self.remove_input).pack(fill=tk.X, pady=2)
         ttk.Button(controls, text="Clear all", command=self.clear_inputs).pack(fill=tk.X, pady=2)
-        ttk.Label(controls, text="Check \nbefore adding", justify="center").pack(fill=tk.X, pady=(10, 2))
+        ttk.Label(controls, text="Files are checked\nwhen added", justify="center").pack(fill=tk.X, pady=(10, 2))
 
         weights = ttk.LabelFrame(outer, text="Merge coefficients", padding=8)
         weights.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -386,7 +437,7 @@ class Krea2MergerGUI:
         actions.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         self.run_button = ttk.Button(actions, text="Run merger", command=self.start_merge)
         self.run_button.pack(side=tk.LEFT)
-        ttk.Button(actions, text="Close", command=self.root.destroy).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Close", command=self.on_close).pack(side=tk.LEFT, padx=8)
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(actions, textvariable=self.status).pack(side=tk.LEFT, padx=12)
 
@@ -400,14 +451,29 @@ class Krea2MergerGUI:
         logscroll.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=logscroll.set)
 
-    def append_log(self, text):
+    # ---- logging -------------------------------------------------------
+    def append_raw(self, text):
+        """Append text exactly as given (used for streamed print output)."""
+        if self.closing:
+            return
         self.log.configure(state="normal")
         self.log.insert(tk.END, text)
-        if not text.endswith("\n"):
-            self.log.insert(tk.END, "\n")
         self.log.see(tk.END)
         self.log.configure(state="disabled")
 
+    def append_log(self, text):
+        self.append_raw(text if text.endswith("\n") else text + "\n")
+
+    def _post(self, func, *a):
+        """Schedule func on the Tk main thread; ignore errors if the window is already gone."""
+        if self.closing:
+            return
+        try:
+            self.root.after(0, func, *a)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    # ---- input list ----------------------------------------------------
     def add_input_files(self):
         paths = filedialog.askopenfilenames(
             title="Select LoRA files",
@@ -425,9 +491,9 @@ class Krea2MergerGUI:
                     details = (
                         f"File: {Path(raw_path).name}\n"
                         f"Tensors: {info['tensor_count']}\n"
-                        f"Layers LoRA: {info['module_count']}\n"
+                        f"LoRA layers: {info['module_count']}\n"
                         f"Ranks: {info['ranks']}\n"
-                        f"Data type: {', '.join(info['dtypes']) or 'не определены'}\n\n"
+                        f"Data types: {', '.join(info['dtypes']) or 'unknown'}\n\n"
                         "Warnings:\n• " + "\n• ".join(warnings) +
                         "\n\nAdd file?"
                     )
@@ -438,12 +504,14 @@ class Krea2MergerGUI:
                 self.weight_vars.append(tk.StringVar(value="1.0"))
                 self.header_infos.append(info)
                 added.append(Path(raw_path).name)
+                for note in info["notes"]:
+                    self.append_log(f"{Path(raw_path).name}: {note}")
             except Exception as exc:
                 rejected.append(Path(raw_path).name + f" — {exc}")
                 messagebox.showerror(
-                    "LoRA incorrect",
-                    f"File don't added to list:\n{Path(raw_path).name}\n\n{exc}\n\n"
-                    "Checking only SafeTensors. File don't saved.",
+                    "Invalid LoRA",
+                    f"File was not added to the list:\n{Path(raw_path).name}\n\n{exc}\n\n"
+                    "Only the SafeTensors structure was checked. The file was not modified.",
                     parent=self.root,
                 )
         self.refresh_inputs()
@@ -452,7 +520,7 @@ class Krea2MergerGUI:
         elif not paths:
             return
         elif rejected:
-            self.status.set(f"Don't added: {len(rejected)}")
+            self.status.set(f"Not added: {len(rejected)}")
 
     def refresh_inputs(self):
         self.input_listbox.delete(0, tk.END)
@@ -504,12 +572,13 @@ class Krea2MergerGUI:
         if path:
             self.output_file.set(path)
 
+    # ---- running -------------------------------------------------------
     def validate_and_build_args(self):
         if not self.input_files:
             raise ValueError("Add at least one input LoRA file.")
         for path in self.input_files:
             if not Path(path).is_file():
-                raise ValueError(f"Input file does not exist:\\n{path}")
+                raise ValueError(f"Input file does not exist:\n{path}")
 
         output_text = self.output_file.get().strip()
         if not output_text:
@@ -530,7 +599,6 @@ class Krea2MergerGUI:
             weights = [float(v.get()) for v in self.weight_vars]
         except (ValueError, tk.TclError):
             raise ValueError("Every coefficient must be a valid number, for example 1.0 or 0.7.")
-        import math
         if not all(math.isfinite(w) for w in weights):
             raise ValueError("Coefficients must be finite numbers.")
         if len(weights) != len(self.input_files):
@@ -544,35 +612,41 @@ class Krea2MergerGUI:
             dtype=self.dtype.get(),
             dry_run=self.dry_run.get(),
             overwrite=self.overwrite.get(),
+            no_pause=True,
         )
 
     def start_merge(self):
+        if self.running:
+            return
         try:
             args = self.validate_and_build_args()
         except Exception as exc:
             messagebox.showerror("Check settings", str(exc), parent=self.root)
             return
+        self.running = True
         self.run_button.configure(state="disabled")
         self.status.set("Running…")
-        self.append_log("\\n" + "=" * 70)
+        self.append_log("\n" + "=" * 70)
         self.append_log("Running merger directly inside this application (no subprocess).")
         self.append_log(f"Inputs: {len(args.inputs)}; rank={args.target_rank}; dtype={args.dtype}; dry_run={args.dry_run}")
         threading.Thread(target=self.run_worker, args=(args,), daemon=True).start()
 
     def run_worker(self, args):
-        capture = io.StringIO()
+        # Output is streamed to the log window line by line while the merge runs.
+        stream = _GuiStream(lambda s: self._post(self.append_raw, s))
         try:
-            with contextlib.redirect_stdout(capture):
+            with contextlib.redirect_stdout(stream):
                 merge_loras(args)
-            self.root.after(0, self.finish_run, 0, capture.getvalue())
+            self._post(self.finish_run, 0, "")
         except Exception:
-            output = capture.getvalue()
-            output += "\\n--- ERROR ---\\n" + traceback.format_exc()
-            self.root.after(0, self.finish_run, 1, output)
+            self._post(self.finish_run, 1, "\n--- ERROR ---\n" + traceback.format_exc())
 
-    def finish_run(self, returncode, output):
-        if output.strip():
-            self.append_log(output.rstrip())
+    def finish_run(self, returncode, extra):
+        self.running = False
+        if self.closing:
+            return
+        if extra.strip():
+            self.append_log(extra.rstrip())
         self.run_button.configure(state="normal")
         if returncode == 0:
             self.status.set("Finished successfully.")
@@ -589,13 +663,22 @@ class Krea2MergerGUI:
                 parent=self.root
             )
 
+    def on_close(self):
+        if self.running and not messagebox.askokcancel(
+            "Merger is running",
+            "The merge is still running. Closing now will abort it (no output file is written "
+            "until the very end). Close anyway?",
+            parent=self.root,
+        ):
+            return
+        self.closing = True
+        self.root.destroy()
 
-def main():
-    root = tk.Tk()
-    Krea2MergerGUI(root)
-    root.mainloop()
 
 def launch_gui():
+    if not HAVE_TK:
+        raise RuntimeError("tkinter is not available in this Python installation. "
+                           "Run the script with command-line arguments instead (see --help).")
     root = tk.Tk()
     Krea2MergerGUI(root)
     root.mainloop()
@@ -610,16 +693,19 @@ if __name__ == "__main__":
             traceback.print_exc()
             sys.exit(1)
     else:
+        # --help and argument errors exit here, before any "press Enter" prompt.
+        cli_args = args_parse()
+        ok = True
         try:
-            merge_loras(args_parse())
-            print("\\nFinished.")
+            merge_loras(cli_args)
+            print("\nFinished.")
         except Exception as exc:
-            print(f"\\nERROR: {exc}", file=sys.stderr)
+            ok = False
+            print(f"\nERROR: {exc}", file=sys.stderr)
             traceback.print_exc()
-            sys.exit(1)
-        finally:
-            if sys.stdin and sys.stdin.isatty():
-                try:
-                    input("\\nPress Enter to close...")
-                except EOFError:
-                    pass
+        if not ok and not cli_args.no_pause and sys.stdin and sys.stdin.isatty():
+            try:
+                input("\nPress Enter to close...")
+            except EOFError:
+                pass
+        sys.exit(0 if ok else 1)
