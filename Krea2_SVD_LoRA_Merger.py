@@ -7,13 +7,29 @@ from collections import defaultdict
 from pathlib import Path
 
 # GUI dependencies are optional: the command-line mode works without tkinter.
+# The GUI uses ttkbootstrap (pip install ttkbootstrap) and falls back to plain ttk without it.
 try:
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import filedialog, messagebox
+    try:
+        import ttkbootstrap as ttk
+        HAVE_BOOTSTRAP = True
+    except ImportError:
+        from tkinter import ttk
+        HAVE_BOOTSTRAP = False
     HAVE_TK = True
 except ImportError:
     tk = ttk = filedialog = messagebox = None
     HAVE_TK = False
+    HAVE_BOOTSTRAP = False
+
+THEMES = ("darkly", "superhero", "cyborg", "flatly", "litera", "cosmo")
+DEFAULT_THEME = "darkly"
+
+
+def bs(style):
+    """bootstyle kwargs for ttkbootstrap; empty for plain ttk (which would reject the option)."""
+    return {"bootstyle": style} if HAVE_BOOTSTRAP else {}
 
 D = Path(r"C:\Lora\krea2")
 DEFAULT_INPUTS = [
@@ -21,7 +37,7 @@ DEFAULT_INPUTS = [
     D / "lora2.safetensors",
     D / "lora3.safetensors",
 ]
-DEFAULT_OUTPUT = D / "Krea2_Merged_3x_SVD_r32_v3.safetensors"
+DEFAULT_OUTPUT = D / "Krea2_Merged_3x.safetensors"
 A_SUFFIXES = (".lora_A.default.weight", ".lora_down.weight", ".lora_A.weight", ".lora_A.default", ".lora_A")
 B_SUFFIXES = (".lora_B.default.weight", ".lora_up.weight", ".lora_B.weight", ".lora_B.default", ".lora_B")
 ALPHA_SUFFIXES = (".lora_alpha", ".alpha")
@@ -243,7 +259,7 @@ def merge_loras(args=None):
     # A dry run never writes anything, so an existing output file is not a problem there.
     if output.exists() and not args.overwrite and not args.dry_run:
         raise FileExistsError(f"Output exists: {output}. Choose another --output or pass --overwrite.")
-    print("Krea2 SVD LoRA Merger v4 — CPU preflight + uniform-rank SVD")
+    print("Krea2 SVD LoRA Merger")
     print(f"Target rank={args.target_rank}; dtype={args.dtype}; sources remain read-only.")
     for p, w in zip(inputs, args.weights): print(f"  {p.name}  coefficient={w:g}")
     print(f"Output: {output}\n")
@@ -365,7 +381,7 @@ class _GuiStream(io.TextIOBase):
 class Krea2MergerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Krea2 SVD LoRA Merger v4 — preflight")
+        self.root.title("Krea2 SVD LoRA Merger")
         self.root.geometry("900x760")
         self.root.minsize(760, 620)
 
@@ -390,7 +406,7 @@ class Krea2MergerGUI:
         outer.rowconfigure(0, weight=3)
         outer.rowconfigure(5, weight=2)
 
-        inp = ttk.LabelFrame(outer, text="Input LoRA files", padding=8)
+        inp = ttk.Labelframe(outer, text="Input LoRA files", padding=8)
         inp.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         inp.columnconfigure(0, weight=1)
         inp.rowconfigure(0, weight=1)
@@ -403,25 +419,25 @@ class Krea2MergerGUI:
 
         controls = ttk.Frame(inp)
         controls.grid(row=0, column=2, sticky="ns", padx=(8, 0))
-        ttk.Button(controls, text="Add files…", command=self.add_input_files).pack(fill=tk.X, pady=2)
-        ttk.Button(controls, text="Remove selected", command=self.remove_input).pack(fill=tk.X, pady=2)
-        ttk.Button(controls, text="Clear all", command=self.clear_inputs).pack(fill=tk.X, pady=2)
+        ttk.Button(controls, text="Add files…", command=self.add_input_files, **bs("primary")).pack(fill=tk.X, pady=2)
+        ttk.Button(controls, text="Remove selected", command=self.remove_input, **bs("danger-outline")).pack(fill=tk.X, pady=2)
+        ttk.Button(controls, text="Clear all", command=self.clear_inputs, **bs("secondary-outline")).pack(fill=tk.X, pady=2)
         ttk.Label(controls, text="Files are checked\nwhen added", justify="center").pack(fill=tk.X, pady=(10, 2))
 
-        weights = ttk.LabelFrame(outer, text="Merge coefficients", padding=8)
+        weights = ttk.Labelframe(outer, text="Merge coefficients", padding=8)
         weights.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         weights.columnconfigure(0, weight=1)
         self.weights_frame = ttk.Frame(weights)
         self.weights_frame.grid(row=0, column=0, sticky="ew")
 
-        paths = ttk.LabelFrame(outer, text="Files", padding=8)
+        paths = ttk.Labelframe(outer, text="Files", padding=8)
         paths.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         paths.columnconfigure(1, weight=1)
         ttk.Label(paths, text="Output file:").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(paths, textvariable=self.output_file).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Button(paths, text="Save as…", command=self.browse_output).grid(row=0, column=2, pady=3)
+        ttk.Button(paths, text="Save as…", command=self.browse_output, **bs("secondary")).grid(row=0, column=2, pady=3)
 
-        settings = ttk.LabelFrame(outer, text="Settings", padding=8)
+        settings = ttk.Labelframe(outer, text="Settings", padding=8)
         settings.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         row = ttk.Frame(settings)
         row.pack(fill=tk.X, pady=2)
@@ -435,13 +451,22 @@ class Krea2MergerGUI:
 
         actions = ttk.Frame(outer)
         actions.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        self.run_button = ttk.Button(actions, text="Run merger", command=self.start_merge)
+        self.run_button = ttk.Button(actions, text="Run merger", command=self.start_merge, **bs("success"))
         self.run_button.pack(side=tk.LEFT)
-        ttk.Button(actions, text="Close", command=self.on_close).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Close", command=self.on_close, **bs("secondary-outline")).pack(side=tk.LEFT, padx=8)
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(actions, textvariable=self.status).pack(side=tk.LEFT, padx=12)
+        if HAVE_BOOTSTRAP:
+            self.theme_var = tk.StringVar(value=DEFAULT_THEME)
+            theme_box = ttk.Combobox(actions, textvariable=self.theme_var, values=THEMES,
+                                     state="readonly", width=10)
+            theme_box.pack(side=tk.RIGHT)
+            theme_box.bind("<<ComboboxSelected>>", self._on_theme)
+            ttk.Label(actions, text="Theme:").pack(side=tk.RIGHT, padx=(0, 6))
+        self.progress = ttk.Progressbar(actions, mode="indeterminate", length=120, **bs("success-striped"))
+        self.progress.pack(side=tk.RIGHT, padx=12)
 
-        logframe = ttk.LabelFrame(outer, text="Run log", padding=6)
+        logframe = ttk.Labelframe(outer, text="Run log", padding=6)
         logframe.grid(row=5, column=0, sticky="nsew")
         logframe.rowconfigure(0, weight=1)
         logframe.columnconfigure(0, weight=1)
@@ -450,6 +475,24 @@ class Krea2MergerGUI:
         logscroll = ttk.Scrollbar(logframe, orient="vertical", command=self.log.yview)
         logscroll.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=logscroll.set)
+        self._style_native_widgets()
+
+    def _style_native_widgets(self):
+        """tk.Listbox and tk.Text are not themed by ttk, so colour them from the active theme."""
+        if not HAVE_BOOTSTRAP:
+            return
+        try:
+            c = self.root.style.colors
+            common = dict(bg=c.inputbg, fg=c.inputfg, relief="flat", borderwidth=0,
+                          highlightthickness=1, highlightbackground=c.border, highlightcolor=c.primary)
+            self.input_listbox.configure(selectbackground=c.primary, selectforeground=c.selectfg, **common)
+            self.log.configure(insertbackground=c.inputfg, font=("Consolas", 9), **common)
+        except Exception:
+            pass  # purely cosmetic; never block the GUI
+
+    def _on_theme(self, _event=None):
+        self.root.style.theme_use(self.theme_var.get())
+        self._style_native_widgets()
 
     # ---- logging -------------------------------------------------------
     def append_raw(self, text):
@@ -626,6 +669,7 @@ class Krea2MergerGUI:
         self.running = True
         self.run_button.configure(state="disabled")
         self.status.set("Running…")
+        self.progress.start(12)
         self.append_log("\n" + "=" * 70)
         self.append_log("Running merger directly inside this application (no subprocess).")
         self.append_log(f"Inputs: {len(args.inputs)}; rank={args.target_rank}; dtype={args.dtype}; dry_run={args.dry_run}")
@@ -645,6 +689,7 @@ class Krea2MergerGUI:
         self.running = False
         if self.closing:
             return
+        self.progress.stop()
         if extra.strip():
             self.append_log(extra.rstrip())
         self.run_button.configure(state="normal")
@@ -679,7 +724,11 @@ def launch_gui():
     if not HAVE_TK:
         raise RuntimeError("tkinter is not available in this Python installation. "
                            "Run the script with command-line arguments instead (see --help).")
-    root = tk.Tk()
+    if HAVE_BOOTSTRAP:
+        root = ttk.Window(themename=DEFAULT_THEME)
+    else:
+        print("Tip: pip install ttkbootstrap for a modern look (using plain ttk for now).", file=sys.stderr)
+        root = tk.Tk()
     Krea2MergerGUI(root)
     root.mainloop()
 
