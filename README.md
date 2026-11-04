@@ -1,3 +1,4 @@
+
 # Krea2 SVD LoRA Merger
 
 Merge several LoRA files into one and re-pack the result to a uniform rank with SVD. Runs entirely on the CPU, never touches your source files, and comes with a small GUI and a command-line mode.
@@ -17,6 +18,8 @@ Typical use: you have three Krea2 LoRAs (a style, a character, a detail LoRA) an
   - dry-run mode validates everything without writing.
 - **Reports the truncation error** (mean / max relative Frobenius error per layer) so you can judge whether the target rank is high enough.
 - **Modern GUI** built on [ttkbootstrap](https://github.com/israel-dryer/ttkbootstrap) with switchable themes, live log and progress indicator. Falls back to plain `tkinter.ttk` if ttkbootstrap is not installed.
+  
+<img width="900" height="760" alt="Screen-2026-11-04_16-32-01" src="https://github.com/user-attachments/assets/8152c06a-f57a-436d-aa27-84658f6d5421" />
 
 ## Requirements
 
