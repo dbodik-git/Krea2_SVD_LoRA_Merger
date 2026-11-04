@@ -29,8 +29,7 @@ Typical use: you have three Krea2 LoRAs (a style, a character, a detail LoRA) an
 - Optional, for the GUI: `tkinter` (ships with the standard Windows/macOS installers) and `ttkbootstrap`
 
 ```bash
-pip install safetensors ttkbootstrap
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
 ```
 
 The command-line mode works without `tkinter` and `ttkbootstrap`.
