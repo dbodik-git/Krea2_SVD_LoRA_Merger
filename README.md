@@ -23,16 +23,16 @@ Typical use: you have three Krea2 LoRAs (a style, a character, a detail LoRA) an
 
 ## Requirements
 
-- Python 3.8 or newer
-- [`torch`](https://pytorch.org/) (the CPU build is enough)
+- Python 3.10 or newer (recommended; use a version supported by your installed PyTorch build)
+- [`torch`](https://pytorch.org/) (CPU build is sufficient; install a PyTorch build compatible with your Python and platform)
 - [`safetensors`](https://github.com/huggingface/safetensors)
-- Optional, for the GUI: `tkinter` (ships with the standard Windows/macOS installers) and `ttkbootstrap`
+- GUI: `tkinter` (usually included with Windows Python installers); `ttkbootstrap` is optional and only provides the themed GUI
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-The command-line mode works without `tkinter` and `ttkbootstrap`.
+The command-line mode works without `tkinter` and `ttkbootstrap`. The included `requirements.txt` pins a full dependency set and includes `ttkbootstrap`; if you only need CLI, install `torch` and `safetensors` compatible with your environment instead. Avoid installing these packages into Forge Neo's Python unless you intentionally want to modify that environment.
 
 ## Usage
 
@@ -41,7 +41,7 @@ The command-line mode works without `tkinter` and `ttkbootstrap`.
 Run the script without arguments:
 
 ```bash
-python Krea2_SVD_LoRA_Merger_EN.py
+python Krea2_SVD_LoRA_Merger.py
 ```
 
 1. Click **Add files...** and pick your LoRAs. Each file is checked on the spot; problems are explained in a dialog.
@@ -55,7 +55,7 @@ Use the theme selector in the bottom-right corner to change the look. The defaul
 ### Command line
 
 ```bash
-python Krea2_SVD_LoRA_Merger_EN.py \
+python Krea2_SVD_LoRA_Merger.py \
     --inputs style.safetensors character.safetensors detail.safetensors \
     --weights 1.0 0.7 0.5 \
     --output merged_r32.safetensors \
@@ -76,7 +76,7 @@ On Windows `cmd`, put it on one line or use `^` instead of `\`.
 | `--overwrite` | off | Allow replacing an existing output file |
 | `--no-pause` | off | Do not wait for Enter after an error (for scripts and `.bat` files) |
 
-The default paths near the top of the script (`D`, `DEFAULT_INPUTS`, `DEFAULT_OUTPUT`) are examples for a Windows setup; edit them to match your folders or always pass `--inputs` and `--output`.
+The default folder `D` is set to `E:\SD\Lora\krea2` for the author's Windows setup. The `lora1.safetensors` etc. names are placeholders: edit `DEFAULT_INPUTS` and `DEFAULT_OUTPUT` to your own filenames or always pass `--inputs` and `--output`.
 
 ## How it works
 
@@ -103,7 +103,7 @@ The stacked rank is the sum of all input ranks, so it is re-packed to the target
 
 If the stacked rank is smaller than the target rank, the extra rank is zero-padded.
 
-The reported error is the share of singular-value energy that was cut off by the truncation. It does not include the final dtype quantization error.
+The reported per-layer metric is the relative Frobenius norm of the discarded singular-value tail: `||S[k:]||₂ / ||S||₂` (with zero returned when `||S||₂ = 0`). The summary reports the mean and maximum of this metric across layers. It estimates only rank-truncation loss; it does not include final output-dtype quantization error.
 
 ## Supported LoRA formats
 
