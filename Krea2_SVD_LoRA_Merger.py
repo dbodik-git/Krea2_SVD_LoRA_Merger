@@ -31,7 +31,7 @@ def bs(style):
     """bootstyle kwargs for ttkbootstrap; empty for plain ttk (which would reject the option)."""
     return {"bootstyle": style} if HAVE_BOOTSTRAP else {}
 
-D = Path(r"C:\Lora\krea2")
+D = Path(r"E:\SD\Lora\krea2")
 DEFAULT_INPUTS = [
     D / "lora1.safetensors",
     D / "lora2.safetensors",
@@ -131,8 +131,11 @@ def inspect_lora_header(path):
             errors.append(f"Wrong A/B shapes in {stem}: A={ash}, B={bsh}")
             continue
         ranks.add(ash[0]); dtypes.update((m["A"]["dtype"], m["B"]["dtype"]))
-        if "alpha" in m and len(m["alpha"]["shape"]) > 1:
-            errors.append(f"Invalid alpha shape in layer {stem}: {m['alpha']['shape']}")
+        if "alpha" in m:
+            alpha_shape = m["alpha"]["shape"]
+            alpha_numel = math.prod(alpha_shape) if alpha_shape else 1
+            if len(alpha_shape) > 1 or alpha_numel != 1:
+                errors.append(f"Invalid alpha shape in layer {stem}: {alpha_shape} (expected scalar or one-element tensor)")
 
     if errors:
         raise ValueError("\n".join(errors))
@@ -298,7 +301,10 @@ def merge_loras(args=None):
     dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtypes[args.dtype]
     out, errs, ranks = {}, [], set()
+    cancel_event = getattr(args, "cancel_event", None)
     for n, stem in enumerate(stems, 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Merge cancelled by user. No output file was written.")
         entries = [m.get(stem) for m in allmods]
         As, Bs = [], []
         for entry, weight in zip(entries, args.weights):
@@ -395,6 +401,7 @@ class Krea2MergerGUI:
         self.dry_run = tk.BooleanVar(value=False)
         self.running = False
         self.closing = False
+        self.cancel_event = threading.Event()
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -508,9 +515,7 @@ class Krea2MergerGUI:
         self.append_raw(text if text.endswith("\n") else text + "\n")
 
     def _post(self, func, *a):
-        """Schedule func on the Tk main thread; ignore errors if the window is already gone."""
-        if self.closing:
-            return
+        """Schedule callbacks on the Tk main thread; ignore errors after destruction."""
         try:
             self.root.after(0, func, *a)
         except (tk.TclError, RuntimeError):
@@ -656,6 +661,7 @@ class Krea2MergerGUI:
             dry_run=self.dry_run.get(),
             overwrite=self.overwrite.get(),
             no_pause=True,
+            cancel_event=self.cancel_event,
         )
 
     def start_merge(self):
@@ -688,6 +694,10 @@ class Krea2MergerGUI:
     def finish_run(self, returncode, extra):
         self.running = False
         if self.closing:
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass
             return
         self.progress.stop()
         if extra.strip():
@@ -709,12 +719,18 @@ class Krea2MergerGUI:
             )
 
     def on_close(self):
-        if self.running and not messagebox.askokcancel(
-            "Merger is running",
-            "The merge is still running. Closing now will abort it (no output file is written "
-            "until the very end). Close anyway?",
-            parent=self.root,
-        ):
+        if self.running:
+            if not messagebox.askokcancel(
+                "Merger is running",
+                "Request cancellation and close after the current layer finishes? "
+                "No output file will be written if cancellation completes before saving.",
+                parent=self.root,
+            ):
+                return
+            self.closing = True
+            self.cancel_event.set()
+            self.status.set("Cancellation requested; waiting for the current layer to finish…")
+            self.run_button.configure(state="disabled")
             return
         self.closing = True
         self.root.destroy()
