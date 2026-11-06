@@ -242,6 +242,97 @@ def repack(A_cat, B_cat, target_rank, torch):
     return Aout, Bout, err, int(S.numel())
 
 
+
+FORGE_USER_METADATA_KEYS = (
+    "description", "sd version", "activation text",
+    "preferred weight", "negative text", "notes",
+)
+
+
+def _read_forge_user_metadata(lora_path):
+    """Read Forge Neo's sidecar JSON; return an empty mapping when absent."""
+    json_path = Path(lora_path).with_suffix(".json")
+    if not json_path.is_file():
+        return {}
+    try:
+        with json_path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"  WARNING: Could not read Forge metadata {json_path.name}: {exc}")
+        return {}
+
+
+def _merge_text_fields(values):
+    """Join comma-separated metadata phrases, preserving order and removing duplicates."""
+    result, seen = [], set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        for phrase in value.split(","):
+            phrase = phrase.strip()
+            key = phrase.casefold()
+            if phrase and key not in seen:
+                seen.add(key)
+                result.append(phrase)
+    return ", ".join(result)
+
+
+def build_forge_user_metadata(input_paths, output_path):
+    """Build Forge Neo's six-key user metadata from input LoRA sidecar JSON files."""
+    sources = [_read_forge_user_metadata(path) for path in input_paths]
+    names = [Path(path).stem for path in input_paths]
+    notes = [item.get("notes", "").strip() for item in sources
+             if isinstance(item.get("notes"), str) and item.get("notes").strip()]
+    weights = []
+    for item in sources:
+        try:
+            weight = float(item.get("preferred weight", 0.0))
+            if math.isfinite(weight):
+                weights.append(weight)
+        except (TypeError, ValueError):
+            pass
+    preferred_weight = sum(weights) / len(weights) if weights else 0.0
+    metadata = {
+        "description": "Merged LoRA: " + ", ".join(names),
+        "sd version": "krea",
+        "activation text": _merge_text_fields([item.get("activation text", "") for item in sources]),
+        "preferred weight": preferred_weight,
+        "negative text": _merge_text_fields([item.get("negative text", "") for item in sources]),
+        "notes": "Merged from: " + ", ".join(names)
+                 + (("\nSource notes:\n" + "\n".join(notes)) if notes else ""),
+    }
+    return {key: metadata[key] for key in FORGE_USER_METADATA_KEYS}
+
+
+def write_forge_user_metadata(output_path, metadata, overwrite=False):
+    """Atomically write Forge Neo-compatible sidecar JSON beside the merged LoRA."""
+    json_path = Path(output_path).with_suffix(".json")
+    if json_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Forge metadata JSON already exists: {json_path}. "
+            "Enable overwrite or choose another output name."
+        )
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    temp = None
+    try:
+        fd, name = tempfile.mkstemp(prefix=json_path.name + ".", suffix=".tmp",
+                                    dir=str(json_path.parent))
+        os.close(fd)
+        temp = Path(name)
+        with temp.open("w", encoding="utf-8", newline="\n") as file:
+            json.dump(metadata, file, indent=4, ensure_ascii=False)
+            file.write("\n")
+        os.replace(str(temp), str(json_path))
+        temp = None
+    finally:
+        if temp is not None:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    print(f"Forge Neo user metadata JSON: {json_path}")
+
 def merge_loras(args=None):
     if args is None:
         args = args_parse()
@@ -262,6 +353,9 @@ def merge_loras(args=None):
     # A dry run never writes anything, so an existing output file is not a problem there.
     if output.exists() and not args.overwrite and not args.dry_run:
         raise FileExistsError(f"Output exists: {output}. Choose another --output or pass --overwrite.")
+    output_json = output.with_suffix(".json")
+    if output_json.exists() and not args.overwrite and not args.dry_run:
+        raise FileExistsError(f"Forge metadata JSON exists: {output_json}. Choose another output or pass --overwrite.")
     print("Krea2 SVD LoRA Merger")
     print(f"Target rank={args.target_rank}; dtype={args.dtype}; sources remain read-only.")
     for p, w in zip(inputs, args.weights): print(f"  {p.name}  coefficient={w:g}")
@@ -365,6 +459,9 @@ def merge_loras(args=None):
     print(f"Output tensors: {len(out)}; factor ranks: {sorted(ranks)}")
     print("Saved file was reopened and validated before atomic replacement.")
     print("All original LoRAs remain untouched. Test in Forge Neo at low strength first.")
+    forge_metadata = build_forge_user_metadata(inputs, output)
+    write_forge_user_metadata(output, forge_metadata, overwrite=args.overwrite)
+    print("Activation text and negative text were collected from source Forge JSON files (missing files are skipped).")
 
 
 class _GuiStream(io.TextIOBase):
