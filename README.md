@@ -17,6 +17,7 @@ Typical use: you have three Krea2 LoRAs (a style, a character, a detail LoRA) an
   - the result is written to a temp file, re-opened and checked for shape and NaN/Inf, and only then atomically moved into place;
   - dry-run mode validates everything without writing.
 - **Reports the truncation error** (mean / max relative Frobenius error per layer) so you can judge whether the target rank is high enough.
+- **Forge Neo user metadata JSON:** reads each input LoRA's sidecar `.json`, combines `activation text` and `negative text` phrases (case-insensitive deduplication), averages available `preferred weight` values, and writes a Forge-compatible six-field JSON beside the merged output. Missing input JSON files are skipped. Existing output JSON is protected unless `--overwrite` is enabled.
 - **Modern GUI** built on [ttkbootstrap](https://github.com/israel-dryer/ttkbootstrap) with switchable themes, live log and progress indicator. Falls back to plain `tkinter.ttk` if ttkbootstrap is not installed.
   
 <img width="900" height="760" alt="Screen-2026-11-04_16-32-01" src="https://github.com/user-attachments/assets/8152c06a-f57a-436d-aa27-84658f6d5421" />
@@ -49,6 +50,7 @@ python Krea2_SVD_LoRA_Merger.py
 3. Choose the **output file**, **target rank** and **dtype**.
 4. Optionally tick **Dry run** to validate without saving.
 5. Click **Run merger** and watch the log.
+6. After a successful merge, a matching Forge Neo `.json` sidecar is also saved. Its activation/negative phrases are gathered from the input sidecar JSON files.
 
 Use the theme selector in the bottom-right corner to change the look. The default theme is set by `DEFAULT_THEME` at the top of the script.
 
