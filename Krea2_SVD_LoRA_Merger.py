@@ -786,6 +786,7 @@ class Krea2MergerGUI:
             overwrite=self.overwrite.get(),
             no_pause=True,
             cancel_event=self.cancel_event,
+            activation_text=self.activation_text.get("1.0", "end-1c").strip(),
         )
 
     def start_merge(self):
