@@ -460,7 +460,7 @@ def merge_loras(args=None):
     print(f"Output tensors: {len(out)}; factor ranks: {sorted(ranks)}")
     print("Saved file was reopened and validated before atomic replacement.")
     print("All original LoRAs remain untouched. Test in Forge Neo at low strength first.")
-    forge_metadata = build_forge_user_metadata(\n        inputs, output, activation_text=getattr(args, "activation_text", None))
+    forge_metadata = build_forge_user_metadata(inputs, output, activation_text=getattr(args, "activation_text", None))
     write_forge_user_metadata(output, forge_metadata, overwrite=args.overwrite)
     print("Activation text and negative text were collected from source Forge JSON files (missing files are skipped).")
 
