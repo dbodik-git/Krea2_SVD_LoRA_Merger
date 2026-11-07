@@ -278,7 +278,7 @@ def _merge_text_fields(values):
     return ", ".join(result)
 
 
-def build_forge_user_metadata(input_paths, output_path):
+def build_forge_user_metadata(input_paths, output_path, activation_text=None):
     """Build Forge Neo's six-key user metadata from input LoRA sidecar JSON files."""
     sources = [_read_forge_user_metadata(path) for path in input_paths]
     names = [Path(path).stem for path in input_paths]
@@ -296,7 +296,8 @@ def build_forge_user_metadata(input_paths, output_path):
     metadata = {
         "description": "Merged LoRA: " + ", ".join(names),
         "sd version": "krea",
-        "activation text": _merge_text_fields([item.get("activation text", "") for item in sources]),
+        "activation text": (activation_text if activation_text is not None else
+                           _merge_text_fields([item.get("activation text", "") for item in sources])),
         "preferred weight": preferred_weight,
         "negative text": _merge_text_fields([item.get("negative text", "") for item in sources]),
         "notes": "Merged from: " + ", ".join(names)
@@ -459,7 +460,7 @@ def merge_loras(args=None):
     print(f"Output tensors: {len(out)}; factor ranks: {sorted(ranks)}")
     print("Saved file was reopened and validated before atomic replacement.")
     print("All original LoRAs remain untouched. Test in Forge Neo at low strength first.")
-    forge_metadata = build_forge_user_metadata(inputs, output)
+    forge_metadata = build_forge_user_metadata(inputs, output, activation_text=getattr(args, "activation_text", None))
     write_forge_user_metadata(output, forge_metadata, overwrite=args.overwrite)
     print("Activation text and negative text were collected from source Forge JSON files (missing files are skipped).")
 
@@ -508,7 +509,7 @@ class Krea2MergerGUI:
         outer.pack(fill=tk.BOTH, expand=True)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=3)
-        outer.rowconfigure(5, weight=2)
+        outer.rowconfigure(6, weight=2)
 
         inp = ttk.Labelframe(outer, text="Input LoRA files", padding=8)
         inp.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
@@ -553,8 +554,24 @@ class Krea2MergerGUI:
         ttk.Checkbutton(settings, text="Allow overwriting existing output", variable=self.overwrite).pack(anchor="w")
         ttk.Checkbutton(settings, text="Dry run (validate only; do not save)", variable=self.dry_run).pack(anchor="w")
 
+        triggers = ttk.Labelframe(outer, text="Forge Neo activation text (editable)", padding=8)
+        triggers.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        triggers.columnconfigure(0, weight=1)
+        ttk.Label(
+            triggers,
+            text="Auto-collected from input LoRA JSON files. Edit freely; this text is saved to the output JSON."
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        trigger_row = ttk.Frame(triggers)
+        trigger_row.grid(row=1, column=0, sticky="ew")
+        trigger_row.columnconfigure(0, weight=1)
+        self.activation_text = tk.Text(trigger_row, height=3, wrap="word", undo=True)
+        self.activation_text.grid(row=0, column=0, sticky="ew")
+        trigger_scroll = ttk.Scrollbar(trigger_row, orient="vertical", command=self.activation_text.yview)
+        trigger_scroll.grid(row=0, column=1, sticky="ns")
+        self.activation_text.configure(yscrollcommand=trigger_scroll.set)
+
         actions = ttk.Frame(outer)
-        actions.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        actions.grid(row=5, column=0, sticky="ew", pady=(0, 8))
         self.run_button = ttk.Button(actions, text="Run merger", command=self.start_merge, **bs("success"))
         self.run_button.pack(side=tk.LEFT)
         ttk.Button(actions, text="Close", command=self.on_close, **bs("secondary-outline")).pack(side=tk.LEFT, padx=8)
@@ -571,7 +588,7 @@ class Krea2MergerGUI:
         self.progress.pack(side=tk.RIGHT, padx=12)
 
         logframe = ttk.Labelframe(outer, text="Run log", padding=6)
-        logframe.grid(row=5, column=0, sticky="nsew")
+        logframe.grid(row=6, column=0, sticky="nsew")
         logframe.rowconfigure(0, weight=1)
         logframe.columnconfigure(0, weight=1)
         self.log = tk.Text(logframe, height=10, wrap="word", state="disabled")
@@ -692,6 +709,17 @@ class Krea2MergerGUI:
                 format="%.2f",
             ).grid(row=0, column=2)
 
+    def refresh_activation_text(self):
+        """Rebuild the editable trigger field from currently selected sidecar JSON files."""
+        combined = _merge_text_fields([
+            _read_forge_user_metadata(path).get("activation text", "")
+            for path in self.input_files
+        ])
+        self.activation_text.delete("1.0", tk.END)
+        self.activation_text.insert("1.0", combined)
+        if not combined and self.input_files:
+            self.append_log("Forge metadata: no activation text found in selected input JSON files.")
+
     def remove_input(self):
         selected = self.input_listbox.curselection()
         if not selected:
@@ -759,6 +787,7 @@ class Krea2MergerGUI:
             overwrite=self.overwrite.get(),
             no_pause=True,
             cancel_event=self.cancel_event,
+            activation_text=self.activation_text.get("1.0", "end-1c").strip(),
         )
 
     def start_merge(self):
