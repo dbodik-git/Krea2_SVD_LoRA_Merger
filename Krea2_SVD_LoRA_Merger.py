@@ -296,7 +296,8 @@ def build_forge_user_metadata(input_paths, output_path, activation_text=None):
     metadata = {
         "description": "Merged LoRA: " + ", ".join(names),
         "sd version": "krea",
-        "activation text": (activation_text if activation_text is not None else\n                           _merge_text_fields([item.get("activation text", "") for item in sources])),
+        "activation text": (activation_text if activation_text is not None else
+                           _merge_text_fields([item.get("activation text", "") for item in sources])),
         "preferred weight": preferred_weight,
         "negative text": _merge_text_fields([item.get("negative text", "") for item in sources]),
         "notes": "Merged from: " + ", ".join(names)
