@@ -50,7 +50,7 @@ python Krea2_SVD_LoRA_Merger.py
 3. Choose the **output file**, **target rank** and **dtype**.
 4. Optionally tick **Dry run** to validate without saving.
 5. Click **Run merger** and watch the log.
-6. After a successful merge, a matching Forge Neo `.json` sidecar is also saved. Its activation/negative phrases are gathered from the input sidecar JSON files.
+6. After a successful merge, a matching Forge Neo `.json` sidecar is also saved. Its activation/negative phrases are gathered from the input sidecar JSON files. In the GUI, the **Forge Neo activation text** box is prefilled from those files and can be edited manually before merging; the edited text is what gets saved.
 
 Use the theme selector in the bottom-right corner to change the look. The default theme is set by `DEFAULT_THEME` at the top of the script.
 
