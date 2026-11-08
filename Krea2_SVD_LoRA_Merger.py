@@ -32,7 +32,7 @@ def bs(style):
     return {"bootstyle": style} if HAVE_BOOTSTRAP else {}
 
 
-D = Path(r"E:\SD\Lora\krea2")
+D = Path(r"\krea2")
 DEFAULT_INPUTS = [
     D / "lora1.safetensors",
     D / "lora2.safetensors",
