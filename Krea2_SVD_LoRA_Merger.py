@@ -288,14 +288,16 @@ def build_forge_user_metadata(input_paths, output_path, activation_text=None):
     for item in sources:
         try:
             weight = float(item.get("preferred weight", 0.0))
-            if math.isfinite(weight):
+            if math.isfinite(weight) and weight > 0:
                 weights.append(weight)
         except (TypeError, ValueError):
             pass
     preferred_weight = sum(weights) / len(weights) if weights else 0.0
+    sd_versions = [item.get("sd version", "").strip() for item in sources
+                   if isinstance(item.get("sd version"), str) and item.get("sd version").strip()]
     metadata = {
         "description": "Merged LoRA: " + ", ".join(names),
-        "sd version": "krea",
+        "sd version": sd_versions[0] if sd_versions else "krea2",
         "activation text": (activation_text if activation_text is not None else
                            _merge_text_fields([item.get("activation text", "") for item in sources])),
         "preferred weight": preferred_weight,
