@@ -53,6 +53,8 @@ def args_parse():
     p.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--activation-text", default=None, help="override Forge Neo activation text in output JSON")
+    p.add_argument("--no-forge-json", action="store_true", help="do not create Forge Neo sidecar JSON")
     p.add_argument("--no-pause", action="store_true",
                    help="do not wait for Enter after an error (for scripts and .bat files)")
     return p.parse_args()
@@ -288,14 +290,16 @@ def build_forge_user_metadata(input_paths, output_path, activation_text=None):
     for item in sources:
         try:
             weight = float(item.get("preferred weight", 0.0))
-            if math.isfinite(weight):
+            if math.isfinite(weight) and weight > 0:
                 weights.append(weight)
         except (TypeError, ValueError):
             pass
     preferred_weight = sum(weights) / len(weights) if weights else 0.0
+    sd_versions = [item.get("sd version", "").strip() for item in sources
+                   if isinstance(item.get("sd version"), str) and item.get("sd version").strip()]
     metadata = {
         "description": "Merged LoRA: " + ", ".join(names),
-        "sd version": "krea",
+        "sd version": sd_versions[0] if sd_versions else "krea2",
         "activation text": (activation_text if activation_text is not None else
                            _merge_text_fields([item.get("activation text", "") for item in sources])),
         "preferred weight": preferred_weight,
@@ -348,13 +352,18 @@ def merge_loras(args=None):
     from safetensors.torch import load_file, save_file
     inputs = [Path(x).expanduser() for x in args.inputs]
     output = Path(args.output).expanduser()
+    if output.suffix.lower() != ".safetensors":
+        raise ValueError("Output filename must end with .safetensors.")
     if output.resolve() in {p.resolve() for p in inputs}: raise ValueError("Output cannot overwrite an input.")
+    output_json = output.with_suffix(".json")
+    input_jsons = {p.with_suffix(".json").resolve() for p in inputs}
+    if output_json.resolve() in input_jsons:
+        raise ValueError("Output sidecar JSON cannot overwrite an input LoRA metadata JSON.")
     missing = [str(p) for p in inputs if not p.is_file()]
     if missing: raise FileNotFoundError("Missing input(s):\n  " + "\n  ".join(missing))
     # A dry run never writes anything, so an existing output file is not a problem there.
     if output.exists() and not args.overwrite and not args.dry_run:
         raise FileExistsError(f"Output exists: {output}. Choose another --output or pass --overwrite.")
-    output_json = output.with_suffix(".json")
     if output_json.exists() and not args.overwrite and not args.dry_run:
         raise FileExistsError(f"Forge metadata JSON exists: {output_json}. Choose another output or pass --overwrite.")
     print("Krea2 SVD LoRA Merger")
@@ -460,9 +469,17 @@ def merge_loras(args=None):
     print(f"Output tensors: {len(out)}; factor ranks: {sorted(ranks)}")
     print("Saved file was reopened and validated before atomic replacement.")
     print("All original LoRAs remain untouched. Test in Forge Neo at low strength first.")
-    forge_metadata = build_forge_user_metadata(inputs, output, activation_text=getattr(args, "activation_text", None))
-    write_forge_user_metadata(output, forge_metadata, overwrite=args.overwrite)
-    print("Activation text and negative text were collected from source Forge JSON files (missing files are skipped).")
+    if not getattr(args, "no_forge_json", False):
+        try:
+            forge_metadata = build_forge_user_metadata(
+                inputs, output, activation_text=getattr(args, "activation_text", None))
+            write_forge_user_metadata(output, forge_metadata, overwrite=args.overwrite)
+            if getattr(args, "activation_text", None) is not None:
+                print("Forge Neo activation text used: manual/CLI override.")
+            else:
+                print("Forge Neo activation text and negative text collected from available source JSON files.")
+        except Exception as exc:
+            print(f"WARNING: LoRA was saved, but Forge Neo JSON could not be written: {exc}")
 
 
 class _GuiStream(io.TextIOBase):
@@ -486,8 +503,8 @@ class Krea2MergerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Krea2 SVD LoRA Merger")
-        self.root.geometry("900x760")
-        self.root.minsize(760, 620)
+        self.root.geometry("900x860")
+        self.root.minsize(760, 700)
 
         self.input_files = []
         self.weight_vars = []
@@ -500,6 +517,8 @@ class Krea2MergerGUI:
         self.running = False
         self.closing = False
         self.cancel_event = threading.Event()
+        self._activation_text_user_modified = False
+        self._activation_text_programmatic = False
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -569,6 +588,7 @@ class Krea2MergerGUI:
         trigger_scroll = ttk.Scrollbar(trigger_row, orient="vertical", command=self.activation_text.yview)
         trigger_scroll.grid(row=0, column=1, sticky="ns")
         self.activation_text.configure(yscrollcommand=trigger_scroll.set)
+        self.activation_text.bind("<<Modified>>", self._on_activation_text_modified)
 
         actions = ttk.Frame(outer)
         actions.grid(row=5, column=0, sticky="ew", pady=(0, 8))
@@ -677,6 +697,7 @@ class Krea2MergerGUI:
                     parent=self.root,
                 )
         self.refresh_inputs()
+        self.refresh_activation_text()
         if added:
             self.status.set(f"Added after check: {len(added)}")
         elif not paths:
@@ -709,14 +730,27 @@ class Krea2MergerGUI:
                 format="%.2f",
             ).grid(row=0, column=2)
 
+    def _on_activation_text_modified(self, _event=None):
+        if self.activation_text.edit_modified():
+            if not self._activation_text_programmatic:
+                self._activation_text_user_modified = True
+            self.activation_text.edit_modified(False)
+
     def refresh_activation_text(self):
-        """Rebuild the editable trigger field from currently selected sidecar JSON files."""
+        """Prefill trigger field from sidecars only while the user has not edited it."""
+        if self._activation_text_user_modified:
+            return
         combined = _merge_text_fields([
             _read_forge_user_metadata(path).get("activation text", "")
             for path in self.input_files
         ])
-        self.activation_text.delete("1.0", tk.END)
-        self.activation_text.insert("1.0", combined)
+        self._activation_text_programmatic = True
+        try:
+            self.activation_text.delete("1.0", tk.END)
+            self.activation_text.insert("1.0", combined)
+            self.activation_text.edit_modified(False)
+        finally:
+            self._activation_text_programmatic = False
         if not combined and self.input_files:
             self.append_log("Forge metadata: no activation text found in selected input JSON files.")
 
@@ -729,12 +763,14 @@ class Krea2MergerGUI:
         del self.weight_vars[i]
         del self.header_infos[i]
         self.refresh_inputs()
+        self.refresh_activation_text()
 
     def clear_inputs(self):
         self.input_files.clear()
         self.weight_vars.clear()
         self.header_infos.clear()
         self.refresh_inputs()
+        self.refresh_activation_text()
 
     def browse_output(self):
         path = filedialog.asksaveasfilename(
@@ -757,10 +793,18 @@ class Krea2MergerGUI:
         if not output_text:
             raise ValueError("Choose an output file.")
         output = Path(output_text).expanduser()
+        if output.suffix.lower() != ".safetensors":
+            raise ValueError("Output filename must end with .safetensors.")
         if output.resolve() in {Path(p).resolve() for p in self.input_files}:
             raise ValueError("Output file must not be one of the input files.")
+        output_json = output.with_suffix(".json")
+        input_jsons = {Path(p).with_suffix(".json").resolve() for p in self.input_files}
+        if output_json.resolve() in input_jsons:
+            raise ValueError("Output sidecar JSON cannot overwrite an input LoRA metadata JSON.")
         if output.exists() and not self.overwrite.get() and not self.dry_run.get():
             raise ValueError("Output file already exists. Choose another name or enable overwrite.")
+        if output_json.exists() and not self.overwrite.get() and not self.dry_run.get():
+            raise ValueError("Output Forge Neo JSON already exists. Choose another name or enable overwrite.")
 
         try:
             rank = int(self.target_rank.get())
@@ -787,7 +831,8 @@ class Krea2MergerGUI:
             overwrite=self.overwrite.get(),
             no_pause=True,
             cancel_event=self.cancel_event,
-            activation_text=self.activation_text.get("1.0", "end-1c").strip(),
+            activation_text=(self.activation_text.get("1.0", "end-1c").strip()
+                             if self._activation_text_user_modified else None),
         )
 
     def start_merge(self):
