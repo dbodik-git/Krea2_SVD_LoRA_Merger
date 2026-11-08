@@ -53,6 +53,8 @@ def args_parse():
     p.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--activation-text", default=None, help="override Forge Neo activation text in output JSON")
+    p.add_argument("--no-forge-json", action="store_true", help="do not create Forge Neo sidecar JSON")
     p.add_argument("--no-pause", action="store_true",
                    help="do not wait for Enter after an error (for scripts and .bat files)")
     return p.parse_args()
@@ -350,13 +352,18 @@ def merge_loras(args=None):
     from safetensors.torch import load_file, save_file
     inputs = [Path(x).expanduser() for x in args.inputs]
     output = Path(args.output).expanduser()
+    if output.suffix.lower() != ".safetensors":
+        raise ValueError("Output filename must end with .safetensors.")
     if output.resolve() in {p.resolve() for p in inputs}: raise ValueError("Output cannot overwrite an input.")
+    output_json = output.with_suffix(".json")
+    input_jsons = {p.with_suffix(".json").resolve() for p in inputs}
+    if output_json.resolve() in input_jsons:
+        raise ValueError("Output sidecar JSON cannot overwrite an input LoRA metadata JSON.")
     missing = [str(p) for p in inputs if not p.is_file()]
     if missing: raise FileNotFoundError("Missing input(s):\n  " + "\n  ".join(missing))
     # A dry run never writes anything, so an existing output file is not a problem there.
     if output.exists() and not args.overwrite and not args.dry_run:
         raise FileExistsError(f"Output exists: {output}. Choose another --output or pass --overwrite.")
-    output_json = output.with_suffix(".json")
     if output_json.exists() and not args.overwrite and not args.dry_run:
         raise FileExistsError(f"Forge metadata JSON exists: {output_json}. Choose another output or pass --overwrite.")
     print("Krea2 SVD LoRA Merger")
@@ -462,9 +469,17 @@ def merge_loras(args=None):
     print(f"Output tensors: {len(out)}; factor ranks: {sorted(ranks)}")
     print("Saved file was reopened and validated before atomic replacement.")
     print("All original LoRAs remain untouched. Test in Forge Neo at low strength first.")
-    forge_metadata = build_forge_user_metadata(inputs, output, activation_text=getattr(args, "activation_text", None))
-    write_forge_user_metadata(output, forge_metadata, overwrite=args.overwrite)
-    print("Activation text and negative text were collected from source Forge JSON files (missing files are skipped).")
+    if not getattr(args, "no_forge_json", False):
+        try:
+            forge_metadata = build_forge_user_metadata(
+                inputs, output, activation_text=getattr(args, "activation_text", None))
+            write_forge_user_metadata(output, forge_metadata, overwrite=args.overwrite)
+            if getattr(args, "activation_text", None) is not None:
+                print("Forge Neo activation text used: manual/CLI override.")
+            else:
+                print("Forge Neo activation text and negative text collected from available source JSON files.")
+        except Exception as exc:
+            print(f"WARNING: LoRA was saved, but Forge Neo JSON could not be written: {exc}")
 
 
 class _GuiStream(io.TextIOBase):
