@@ -47,10 +47,10 @@ python Krea2_SVD_LoRA_Merger.py
 
 1. Click **Add files...** and pick your LoRAs. Each file is checked on the spot; problems are explained in a dialog.
 2. Set a **coefficient** for every LoRA (default `1.0`).
-3. Choose the **output file**, **target rank** and **dtype**.
-4. Optionally tick **Dry run** to validate without saving.
-5. Click **Run merger** and watch the log.
-6. After a successful merge, a matching Forge Neo `.json` sidecar is also saved. Its activation/negative phrases are gathered from the input sidecar JSON files. In the GUI, the **Forge Neo activation text** box is prefilled from those files and can be edited manually before merging; the edited text is what gets saved.
+3. Choose the **output file** (it must end in `.safetensors`), **target rank** and **dtype**.
+4. Check the **activation text** field. It is filled automatically from the input LoRAs' JSON files and you can edit it (see [Forge Neo sidecar JSON](#forge-neo-sidecar-json)).
+5. Optionally tick **Dry run** to validate without saving, or untick **Write Forge Neo sidecar JSON** if you do not need it.
+6. Click **Run merger** and watch the log. Click **Cancel** to stop a running merge (see [Cancelling](#cancelling)).
 
 Use the theme selector in the bottom-right corner to change the look. The default theme is set by `DEFAULT_THEME` at the top of the script.
 
@@ -70,16 +70,44 @@ On Windows `cmd`, put it on one line or use `^` instead of `\`.
 | Option | Default | Description |
 | --- | --- | --- |
 | `--inputs` | three example paths in the script | Input `.safetensors` LoRA files |
-| `--output` | example path in the script | Output file |
+| `--output` | example path in the script | Output file (must end in `.safetensors`) |
 | `--weights` | `1.0` for every input | One coefficient per input |
 | `--target-rank` | `32` | Rank of the merged LoRA |
 | `--dtype` | `bf16` | Output dtype: `bf16`, `fp16` or `fp32` |
 | `--dry-run` | off | Validate everything, write nothing |
-| `--overwrite` | off | Allow replacing an existing output file |
+| `--overwrite` | off | Allow replacing an existing output file and its sidecar JSON (the old JSON is kept as `.json.bak`) |
 | `--no-pause` | off | Do not wait for Enter after an error (for scripts and `.bat` files) |
+| `--activation-text` | collected from the input JSON files | Activation text for the output Forge Neo JSON (an empty string `""` writes an empty field) |
+| `--no-forge-json` | off | Do not write the Forge Neo sidecar JSON |
 
-The default folder `D` is set to `E:\SD\Lora\krea2` for the author's Windows setup. The `lora1.safetensors` etc. names are placeholders: edit `DEFAULT_INPUTS` and `DEFAULT_OUTPUT` to your own filenames or always pass `--inputs` and `--output`.
+The default paths near the top of the script (`D`, `DEFAULT_INPUTS`, `DEFAULT_OUTPUT`) are examples for a Windows setup; edit them to match your folders or always pass `--inputs` and `--output`.
 
+## Forge Neo sidecar JSON
+
+Forge Neo reads per-LoRA user metadata from a JSON file with the same name as the LoRA (`my_lora.safetensors` is paired with `my_lora.json`). By default the merger writes this file next to the output, built from the JSON files that sit next to the input LoRAs. Inputs without a JSON file are simply skipped.
+
+| Field | How it is built |
+| --- | --- |
+| `description` | `Merged LoRA: ` followed by the input file names |
+| `sd version` | The most common value among the input JSON files (`Unknown` is ignored). If none has one, the `FORGE_SD_VERSION_FALLBACK` constant at the top of the script is used (`krea`). |
+| `activation text` | Phrases from all inputs, comma-separated, duplicates removed (case-insensitive), or your own text |
+| `preferred weight` | The average of the positive values in the inputs. Inputs without a value are ignored, and `0` (Forge's "not set") is written if there are none. |
+| `negative text` | Merged the same way as the activation text |
+| `notes` | `Merged from: ` followed by the input names, plus the notes of the inputs |
+
+A few things to know:
+
+- The merge coefficients are already baked into the weights, so the averaged `preferred weight` is only a starting point. Test the result and adjust it.
+- **Activation text in the GUI:** the field is refilled whenever you add or remove files. Text you typed yourself is not overwritten; the **Reload from JSON** button rebuilds it. If you clear the field on purpose, an empty activation text is saved. From the command line use `--activation-text`.
+- **Existing JSON:** without `--overwrite` (or the overwrite checkbox) an existing JSON stops the run before any work is done. With overwrite, the old file is first copied to `<name>.json.bak`, because it may contain hand-written notes.
+- If the LoRA was saved but the JSON could not be written, you get a warning rather than a failed run.
+- Use `--no-forge-json` or untick the checkbox in the GUI to skip the file. A dry run prints the JSON that would be written.
+
+## Cancelling
+
+The **Cancel** button in the GUI is active while a merge is running. The merge stops at the next safe point: before each input file is loaded, between layers, and right before saving. Once the output starts being written, saving and validation are not interrupted, which keeps the atomic-save guarantee. A cancelled run writes neither the LoRA nor the JSON. Closing the window during a run asks for confirmation and cancels in the same way.
+
+In command-line mode, press `Ctrl+C`; temporary files are cleaned up.
 ## How it works
 
 For every layer, each LoRA contributes a weight delta
