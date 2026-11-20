@@ -136,15 +136,17 @@ The reported per-layer metric is the relative Frobenius norm of the discarded si
 
 ## Supported LoRA formats
 
-- Key styles: `lora_down` / `lora_up` (kohya-style) and `lora_A` / `lora_B` (PEFT/diffusers-style, including `.default`).
+- Key styles: Kohya `lora_down` / `lora_up` and PEFT/Diffusers `lora_A` / `lora_B`, including named adapters such as `.default` and `.adapter_name`.
 - Alpha keys: `.alpha` or `.lora_alpha`. Missing alpha is treated as `alpha = rank` (scale 1).
-- Linear (2D) layers only.
+- Linear (2D) layers.
+- Conv2D (4D) layers where **one factor has a 1×1 kernel**: either spatial down + 1×1 up, or 1×1 down + spatial up. These are converted to equivalent 2D matrices for the existing QR + small-core SVD engine, then reshaped back.
 - Layer names must match between LoRAs to be summed. A layer that exists in only one LoRA is kept and re-packed on its own.
 - The output reuses the key style of the first LoRA that contains the layer.
 
 ## Limitations and notes
 
-- **Conv (4D) LoRAs, LoKr and LoHa are not supported** and are rejected with an error.
+- Conv2D pairs where both factors have spatial kernels are rejected: they cannot be treated as a simple matrix product by this implementation.
+- Conv1D/Conv3D, LoKr, LoHa, DoRA magnitude vectors and other adapter families are not supported and are rejected rather than dropped.
 - **Alpha without tensors:** if a LoRA has no alpha tensors but was trained with `alpha != rank` (the value is then only in `ss_network_alpha` metadata or in a training config), the script assumes scale 1 and prints a warning. Check such files by testing the result.
 - **Memory:** all input LoRAs are loaded into RAM at once, in their stored dtype.
 - **Metadata:** the output is labeled `modelspec.architecture = krea2/lora` and `ss_base_model_version = krea2`. Along with it the file records the merge inputs, coefficients, target rank and dtype (`merge_*` keys). Change these in `merge_loras()` if you use the script for another model.
