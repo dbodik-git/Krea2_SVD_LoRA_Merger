@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Krea2 SVD LoRA Merger v4: CPU merge, QR + small-core SVD, atomic save."""
+"""Krea2 SVD LoRA Merger v5-dev: CPU merge, QR + small-core SVD, atomic save."""
 import argparse, json, math, os, re, shutil, sys, tempfile, traceback, contextlib, io, struct
 import threading
 from collections import Counter, defaultdict
