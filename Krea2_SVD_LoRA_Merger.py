@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """Krea2 SVD LoRA Merger v4: CPU merge, QR + small-core SVD, atomic save."""
-import argparse, json, math, os, shutil, sys, tempfile, traceback, contextlib, io, struct
+import argparse, json, math, os, re, shutil, sys, tempfile, traceback, contextlib, io, struct
 import threading
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -133,10 +133,13 @@ def inspect_lora_header(path):
             errors.append(f"Incomplete A/B pair: {stem}")
             continue
         ash, bsh = m["A"]["shape"], m["B"]["shape"]
-        if len(ash) != 2 or len(bsh) != 2 or ash[0] != bsh[1] or ash[0] < 1:
-            errors.append(f"Wrong A/B shapes in {stem}: A={ash}, B={bsh}")
+        try:
+            layout = describe_factor_layout(ash, bsh)
+            m["layout"] = layout
+        except ValueError as exc:
+            errors.append(f"Unsupported A/B shapes in {stem}: A={ash}, B={bsh} ({exc})")
             continue
-        ranks.add(ash[0]); dtypes.update((m["A"]["dtype"], m["B"]["dtype"]))
+        ranks.add(layout["rank"]); dtypes.update((m["A"]["dtype"], m["B"]["dtype"]))
         if "alpha" in m:
             alpha_shape = m["alpha"]["shape"]
             alpha_numel = math.prod(alpha_shape) if alpha_shape else 1
@@ -171,7 +174,12 @@ def compare_lora_headers(new_info, existing_infos):
         bad = []
         for stem in shared:
             a, b = new_info["modules"][stem], old["modules"][stem]
-            if a["A"]["shape"][1] != b["A"]["shape"][1] or a["B"]["shape"][0] != b["B"]["shape"][0]:
+            try:
+                la = a.get("layout") or describe_factor_layout(a["A"]["shape"], a["B"]["shape"])
+                lb = b.get("layout") or describe_factor_layout(b["A"]["shape"], b["B"]["shape"])
+                if la["signature"] != lb["signature"]:
+                    bad.append(stem)
+            except ValueError:
                 bad.append(stem)
         if bad:
             raise ValueError(
@@ -190,11 +198,81 @@ def compare_lora_headers(new_info, existing_infos):
 
 
 def parse_key(key):
-    for kind, suffixes in (("A", A_SUFFIXES), ("B", B_SUFFIXES), ("alpha", ALPHA_SUFFIXES)):
-        for s in suffixes:
-            if key.endswith(s):
-                return kind, key[:-len(s)], s
+    # Kohya: lora_down/up[.weight]; PEFT/Diffusers: lora_A/B[.<adapter>].weight.
+    for kind, patterns in (
+        ("A", (r"\.lora_A(?:\.[^.]+)?(?:\.weight)?$", r"\.lora_down(?:\.weight)?$")),
+        ("B", (r"\.lora_B(?:\.[^.]+)?(?:\.weight)?$", r"\.lora_up(?:\.weight)?$")),
+    ):
+        for pattern in patterns:
+            match = re.search(pattern, key)
+            if match:
+                return kind, key[:match.start()], match.group(0)
+    for suffix in ALPHA_SUFFIXES:
+        if key.endswith(suffix):
+            return "alpha", key[:-len(suffix)], suffix
     return None
+
+
+def describe_factor_layout(a_shape, b_shape):
+    """Describe factor shapes supported by the shared matrix SVD engine."""
+    a_shape, b_shape = tuple(a_shape), tuple(b_shape)
+    if len(a_shape) == 2 and len(b_shape) == 2:
+        rank = a_shape[0]
+        if rank < 1 or rank != b_shape[1]:
+            raise ValueError("Linear factors must have matching nonzero ranks.")
+        return {
+            "kind": "linear", "rank": rank,
+            "signature": ("linear", a_shape[1], b_shape[0]),
+            "a_matrix_shape": a_shape, "b_matrix_shape": b_shape,
+        }
+    if len(a_shape) == 4 and len(b_shape) == 4:
+        rank = a_shape[0]
+        if rank < 1 or rank != b_shape[1]:
+            raise ValueError("Conv2D factors must have matching nonzero ranks.")
+        a_kernel, b_kernel = a_shape[2:], b_shape[2:]
+        if all(x == 1 for x in b_kernel):
+            return {
+                "kind": "conv2d_down", "rank": rank,
+                "signature": ("conv2d_down", a_shape[1:], b_shape[0]),
+                "a_matrix_shape": (rank, math.prod(a_shape[1:])),
+                "b_matrix_shape": (b_shape[0], rank),
+                "a_output_shape": (None, *a_shape[1:]),
+                "b_output_shape": (b_shape[0], None, *b_kernel),
+            }
+        if all(x == 1 for x in a_kernel):
+            return {
+                "kind": "conv2d_up", "rank": rank,
+                "signature": ("conv2d_up", a_shape[1], b_shape[0], b_kernel),
+                "a_matrix_shape": (rank, a_shape[1]),
+                "b_matrix_shape": (b_shape[0] * math.prod(b_kernel), rank),
+                "a_output_shape": (None, a_shape[1], *a_kernel),
+                "b_output_shape": (b_shape[0], None, *b_kernel),
+            }
+        raise ValueError("Only Conv2D pairs with a 1x1 kernel on one factor are supported.")
+    raise ValueError("Expected 2D Linear or supported 4D Conv2D factors.")
+
+
+def flatten_factors(a, b, layout):
+    """Convert supported factor tensors to equivalent 2D matrices for SVD."""
+    if layout["kind"] in ("linear", "conv2d_down"):
+        return a.reshape(layout["a_matrix_shape"]), b.reshape(layout["b_matrix_shape"])
+    if layout["kind"] == "conv2d_up":
+        return a.reshape(layout["a_matrix_shape"]), b.permute(0, 2, 3, 1).reshape(layout["b_matrix_shape"])
+    raise ValueError(f"Unknown factor layout: {layout['kind']}")
+
+
+def restore_factors(a, b, layout, target_rank):
+    """Restore SVD factors to the original Linear/Conv2D tensor layout."""
+    if layout["kind"] == "linear":
+        return a, b
+    if layout["kind"] == "conv2d_down":
+        return (a.reshape(target_rank, *layout["a_output_shape"][1:]),
+                b.reshape(layout["b_output_shape"][0], target_rank, *layout["b_output_shape"][2:]))
+    if layout["kind"] == "conv2d_up":
+        out_channels, _, kh, kw = layout["b_output_shape"]
+        return (a.reshape(target_rank, *layout["a_output_shape"][1:]),
+                b.reshape(out_channels, kh, kw, target_rank).permute(0, 3, 1, 2).contiguous())
+    raise ValueError(f"Unknown factor layout: {layout['kind']}")
 
 
 def load_lora(path, torch, load_file):
@@ -215,8 +293,10 @@ def load_lora(path, torch, load_file):
         if "A" not in m or "B" not in m:
             raise ValueError(f"{path.name}: incomplete A/B pair: {stem}")
         A, B = m["A"], m["B"]
-        if A.ndim != 2 or B.ndim != 2 or A.shape[0] != B.shape[1]:
-            raise ValueError(f"{path.name}: invalid factor shapes for {stem}: A={tuple(A.shape)} B={tuple(B.shape)}")
+        try:
+            m["layout"] = describe_factor_layout(tuple(A.shape), tuple(B.shape))
+        except ValueError as exc:
+            raise ValueError(f"{path.name}: unsupported factor shapes for {stem}: A={tuple(A.shape)} B={tuple(B.shape)} ({exc})") from exc
         if "alpha" in m:
             a = m["alpha"].float().reshape(-1)
             if a.numel() != 1: raise ValueError(f"{path.name}: alpha must be scalar: {stem}")
@@ -391,6 +471,7 @@ def merge_loras(args=None):
             raise FileExistsError(f"Forge metadata JSON exists: {output_json}. Choose another output or pass --overwrite.")
     print("Krea2 SVD LoRA Merger")
     print(f"Target rank={args.target_rank}; dtype={args.dtype}; sources remain read-only.")
+    print("Supported: Linear LoRA and Conv2D LoRA with a 1x1 kernel on one factor; Kohya/PEFT key variants.")
     for p, w in zip(inputs, args.weights): print(f"  {p.name}  coefficient={w:g}")
     print(f"Output: {output}\n")
     allmods = []
@@ -420,9 +501,10 @@ def merge_loras(args=None):
     for stem in stems:
         present = [m[stem] for m in allmods if stem in m]
         a0, b0 = present[0]["A"], present[0]["B"]
+        base_layout = present[0]["layout"]
         for m in present[1:]:
-            if m["A"].shape[1] != a0.shape[1] or m["B"].shape[0] != b0.shape[0]:
-                raise ValueError(f"Non-rank dimensions mismatch for {stem}; no output written.")
+            if m["layout"]["signature"] != base_layout["signature"]:
+                raise ValueError(f"Factor layout or non-rank dimensions mismatch for {stem}; no output written.")
     print(f"\nUnion: {len(stems)} module stems; all detected shapes compatible.")
     activation_override = getattr(args, "activation_text", None)
     forge_metadata = (build_forge_user_metadata(inputs, activation_text=activation_override)
@@ -438,14 +520,18 @@ def merge_loras(args=None):
     for n, stem in enumerate(stems, 1):
         check_cancel()
         entries = [m.get(stem) for m in allmods]
+        present_entries = [entry for entry in entries if entry is not None]
+        layout = present_entries[0]["layout"]
         As, Bs = [], []
         for entry, weight in zip(entries, args.weights):
             if entry is None: continue
-            As.append(entry["A"].float())
+            a_matrix, b_matrix = flatten_factors(entry["A"].float(), entry["B"].float(), layout)
+            As.append(a_matrix)
             scale = entry["alpha_value"] / entry["rank"] * weight
-            Bs.append(entry["B"].float() * scale)
+            Bs.append(b_matrix * scale)
         Ac, Bc = torch.cat(As, dim=0), torch.cat(Bs, dim=1)
         An, Bn, err, core_rank = repack(Ac, Bc, args.target_rank, torch)
+        An, Bn = restore_factors(An, Bn, layout, args.target_rank)
         if not torch.isfinite(An).all() or not torch.isfinite(Bn).all():
             raise FloatingPointError(f"Non-finite factor at {stem}")
         An, Bn = An.to(dtype).contiguous(), Bn.to(dtype).contiguous()
