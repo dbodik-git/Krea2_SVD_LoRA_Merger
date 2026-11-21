@@ -23,7 +23,7 @@ def is_lokr_state_keys(keys):
     return any(isinstance(key, str) and key.endswith(suffixes) for key in keys)
 
 
-def _group_lokr(items, shape_only=False):
+def _group_lokr(items):
     groups = defaultdict(dict)
     unknown = []
     for key, value in items.items():
@@ -62,7 +62,7 @@ def _group_lokr(items, shape_only=False):
 
 def inspect_lokr_header(path, metadata, tensors):
     """Build LoRA-compatible synthetic dimensions from a LoKr SafeTensors header."""
-    groups = _group_lokr(tensors, shape_only=True)
+    groups = _group_lokr(tensors)
     modules, dtypes = {}, set()
     for stem, pair in groups.items():
         w1 = pair["w1"]
@@ -163,7 +163,7 @@ def convert_lokr_state_dict(state_dict, torch, target_rank, source_name="<LoKr>"
             alpha = pair["alpha"].float().reshape(-1)
             if alpha.numel() != 1 or not torch.isfinite(alpha).all():
                 raise ValueError(f"{source_name}: invalid LoKr alpha at {stem}.")
-        B, A, kept, available = _kronecker_svd(w1, w2, int(target_rank), torch, stem)
+        B, A, _, _ = _kronecker_svd(w1, w2, int(target_rank), torch, stem)
         converted[stem + ".lora_down.weight"] = A
         converted[stem + ".lora_up.weight"] = B
         converted[stem + ".alpha"] = torch.tensor(float(target_rank), dtype=torch.float32)
