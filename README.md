@@ -145,7 +145,7 @@ The reported per-layer metric is the relative Frobenius norm of the discarded si
 
 ## Limitations and notes
 
-- **LoKr:** direct full-matrix `lokr_w1` / `lokr_w2` modules are detected automatically and converted to ordinary SVD LoRA at the selected target rank before merging. Conversion uses the factor SVDs and does not materialize the full Kronecker matrix. Decomposed LoKr (`lokr_w*_a/b`), Tucker (`lokr_t2`) and LoHa are not supported and are rejected explicitly. Conv (4D) LoRA remains unsupported.
+- **LoKr:** direct full-matrix `lokr_w1` / `lokr_w2` modules are detected automatically and converted to ordinary SVD LoRA at the selected target rank before merging. Conversion uses the factor SVDs and does not materialize the full Kronecker matrix. For direct full-matrix LyCORIS LoKr, alpha is not used as an extra scale; the converted LoRA is written with alpha equal to the target rank. Decomposed LoKr (`lokr_w*_a/b`), Tucker (`lokr_t2`) and LoHa are not supported and are rejected explicitly. Conv (4D) LoRA remains unsupported.
 - **Alpha without tensors:** if a LoRA has no alpha tensors but was trained with `alpha != rank` (the value is then only in `ss_network_alpha` metadata or in a training config), the script assumes scale 1 and prints a warning. Check such files by testing the result.
 - **Memory:** all input LoRAs are loaded into RAM at once, in their stored dtype.
 - **Metadata:** the output is labeled `modelspec.architecture = krea2/lora` and `ss_base_model_version = krea2`. Along with it the file records the merge inputs, coefficients, target rank and dtype (`merge_*` keys). Change these in `merge_loras()` if you use the script for another model.
@@ -157,7 +157,7 @@ The reported per-layer metric is the relative Frobenius norm of the discarded si
 | --- | --- |
 | `ModuleNotFoundError: tkinter` | Your Python has no Tk. Use the command-line mode, or install Python with Tcl/Tk support. |
 | GUI looks plain | `ttkbootstrap` is not installed: `pip install ttkbootstrap`. |
-| `Unrecognized tensors ...` | The file contains keys that are not LoRA A/B/alpha pairs (for example LoKr/LoHa or extra data). The script stops on purpose rather than dropping data. |
+| `Unrecognized tensors ...` | The file contains unsupported or mixed tensor keys (for example LoHa, decomposed/Tucker LoKr, or extra data). Supported full-matrix LoKr is converted automatically. The script stops rather than dropping unknown data. |
 | `Dimension mismatch ...` | The LoRAs were trained for different base models or architectures. |
 | `fp16 overflow at ...` | Use `bf16` or `fp32` as the output dtype. |
 | `Output exists ...` | Pick another file name or pass `--overwrite` (or tick the checkbox in the GUI). |
