@@ -5,6 +5,7 @@ import argparse, json, math, os, shutil, sys, tempfile, traceback, contextlib, i
 import threading
 from collections import Counter, defaultdict
 from pathlib import Path
+from lokr_to_svd_lora import is_lokr_state_keys, inspect_lokr_header, convert_lokr_state_dict
 
 # GUI dependencies are optional: the command-line mode works without tkinter.
 # The GUI uses ttkbootstrap (pip install ttkbootstrap) and falls back to plain ttk without it.
@@ -110,6 +111,9 @@ def inspect_lora_header(path):
             raise ValueError(f"Incorrect data_offsets: {key}")
         tensors[key] = {"shape": tuple(shape), "dtype": dtype}
 
+    if is_lokr_state_keys(tensors):
+        return inspect_lokr_header(path, metadata, tensors)
+
     mods, unknown = defaultdict(dict), []
     for key, info in tensors.items():
         parsed = parse_key(key)
@@ -197,8 +201,7 @@ def parse_key(key):
     return None
 
 
-def load_lora(path, torch, load_file):
-    raw = load_file(str(path), device="cpu")
+def load_lora(path, torch, load_file):    raw = load_file(str(path), device="cpu")
     mods, unknown = defaultdict(dict), []
     for key, tensor in raw.items():
         parsed = parse_key(key)
@@ -397,8 +400,7 @@ def merge_loras(args=None):
     for p in inputs:
         check_cancel()
         with safe_open(str(p), framework="pt", device="cpu") as sf: md = sf.metadata() or {}
-        mods = load_lora(p, torch, load_file)
-        allmods.append(mods)
+        mods = load_lora(p, torch, load_file, args.target_rank)        allmods.append(mods)
         print(f"Read {p.name}: {len(mods)} modules; architecture={md.get('modelspec.architecture','unspecified')}; base={md.get('ss_base_model_version','unspecified')}")
         # Without alpha tensors the scale is assumed to be 1 (alpha = rank). Warn if metadata disagrees.
         no_alpha_ranks = {m["rank"] for m in mods.values() if "alpha" not in m}
@@ -597,8 +599,7 @@ class Krea2MergerGUI:
         settings.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         row = ttk.Frame(settings)
         row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="Target rank:").pack(side=tk.LEFT)
-        ttk.Spinbox(row, from_=1, to=4096, textvariable=self.target_rank, width=8).pack(side=tk.LEFT, padx=(6, 18))
+        ttk.Label(row, text="Target rank:").pack(side=tk.LEFT)        ttk.Spinbox(row, from_=1, to=4096, textvariable=self.target_rank, width=8).pack(side=tk.LEFT, padx=(6, 18))
         ttk.Label(row, text="Output dtype:").pack(side=tk.LEFT)
         ttk.Combobox(row, textvariable=self.dtype, values=("bf16", "fp16", "fp32"),
                      state="readonly", width=8).pack(side=tk.LEFT, padx=6)
@@ -798,216 +799,3 @@ class Krea2MergerGUI:
             self.activation_text.edit_modified(False)
             self.activation_text.edit_reset()
         finally:
-            self._autofilling = False
-        self.activation_dirty = False
-        if not combined and self.input_files:
-            self.append_log("Forge metadata: no activation text found in selected input JSON files.")
-
-    def remove_input(self):
-        selected = self.input_listbox.curselection()
-        if not selected:
-            return
-        i = selected[0]
-        del self.input_files[i]
-        del self.weight_vars[i]
-        del self.header_infos[i]
-        self.refresh_inputs()
-        self.refresh_activation_text()
-
-    def clear_inputs(self):
-        self.input_files.clear()
-        self.weight_vars.clear()
-        self.header_infos.clear()
-        self.refresh_inputs()
-        self.refresh_activation_text()
-
-    def browse_output(self):
-        path = filedialog.asksaveasfilename(
-            title="Choose output LoRA file",
-            defaultextension=".safetensors",
-            filetypes=(("Safetensors files", "*.safetensors"), ("All files", "*.*"))
-        )
-        if path:
-            self.output_file.set(path)
-
-    # ---- running -------------------------------------------------------
-    def validate_and_build_args(self):
-        if not self.input_files:
-            raise ValueError("Add at least one input LoRA file.")
-        for path in self.input_files:
-            if not Path(path).is_file():
-                raise ValueError(f"Input file does not exist:\n{path}")
-
-        output_text = self.output_file.get().strip()
-        if not output_text:
-            raise ValueError("Choose an output file.")
-        output = Path(output_text).expanduser()
-        if output.suffix.lower() != ".safetensors":
-            raise ValueError("Output file must have the .safetensors extension.")
-        if output.resolve() in {Path(p).resolve() for p in self.input_files}:
-            raise ValueError("Output file must not be one of the input files.")
-        if output.exists() and not self.overwrite.get() and not self.dry_run.get():
-            raise ValueError("Output file already exists. Choose another name or enable overwrite.")
-        output_json = output.with_suffix(".json")
-        if (self.write_json.get() and not self.dry_run.get() and not self.overwrite.get()
-                and output_json.exists()):
-            raise ValueError(f"Forge metadata JSON already exists:\n{output_json}\n\n"
-                             "Choose another name, enable overwrite, or untick the Forge JSON option.")
-
-        try:
-            rank = int(self.target_rank.get())
-        except (ValueError, tk.TclError):
-            raise ValueError("Target rank must be a whole number.")
-        if rank < 1:
-            raise ValueError("Target rank must be at least 1.")
-        try:
-            weights = [float(v.get()) for v in self.weight_vars]
-        except (ValueError, tk.TclError):
-            raise ValueError("Every coefficient must be a valid number, for example 1.0 or 0.7.")
-        if not all(math.isfinite(w) for w in weights):
-            raise ValueError("Coefficients must be finite numbers.")
-        if len(weights) != len(self.input_files):
-            raise ValueError("Supply exactly one coefficient per input LoRA.")
-
-        text = self.activation_text.get("1.0", "end-1c").strip()
-        # None = let the merger collect it from the source JSON files; "" only if the user cleared it on purpose.
-        activation_text = text if (text or self.activation_dirty) else None
-
-        return argparse.Namespace(
-            inputs=list(self.input_files),
-            output=str(output),
-            weights=weights,
-            target_rank=rank,
-            dtype=self.dtype.get(),
-            dry_run=self.dry_run.get(),
-            overwrite=self.overwrite.get(),
-            no_pause=True,
-            cancel_event=self.cancel_event,
-            activation_text=activation_text,
-            no_forge_json=not self.write_json.get(),
-        )
-
-    def start_merge(self):
-        if self.running:
-            return
-        try:
-            args = self.validate_and_build_args()
-        except Exception as exc:
-            messagebox.showerror("Check settings", str(exc), parent=self.root)
-            return
-        self.running = True
-        self.cancel_event.clear()
-        self.run_button.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
-        self.status.set("Running…")
-        self.progress.start(12)
-        self.append_log("\n" + "=" * 70)
-        self.append_log("Running merger directly inside this application (no subprocess).")
-        self.append_log(f"Inputs: {len(args.inputs)}; rank={args.target_rank}; dtype={args.dtype}; dry_run={args.dry_run}")
-        threading.Thread(target=self.run_worker, args=(args,), daemon=True).start()
-
-    def run_worker(self, args):
-        # Output is streamed to the log window line by line while the merge runs.
-        stream = _GuiStream(lambda s: self._post(self.append_raw, s))
-        try:
-            with contextlib.redirect_stdout(stream):
-                merge_loras(args)
-            self._post(self.finish_run, 0, "")
-        except InterruptedError:
-            self._post(self.finish_run, 2, "\nMerge cancelled. No output file was written.")
-        except Exception:
-            self._post(self.finish_run, 1, "\n--- ERROR ---\n" + traceback.format_exc())
-
-    def finish_run(self, returncode, extra):
-        self.running = False
-        if self.closing:
-            try:
-                self.root.destroy()
-            except tk.TclError:
-                pass
-            return
-        self.progress.stop()
-        self.cancel_button.configure(state="disabled")
-        if extra.strip():
-            self.append_log(extra.rstrip())
-        self.run_button.configure(state="normal")
-        if returncode == 2:
-            self.status.set("Cancelled.")
-        elif returncode == 0:
-            self.status.set("Finished successfully.")
-            messagebox.showinfo(
-                "Merger finished",
-                "The script finished successfully.\nCheck the run log for the output path and validation details.",
-                parent=self.root
-            )
-        else:
-            self.status.set(f"Failed (exit code {returncode}).")
-            messagebox.showerror(
-                "Merger failed",
-                "The merger returned an error. The full output is shown in the Run log below.",
-                parent=self.root
-            )
-
-    def cancel_merge(self):
-        if not self.running or self.cancel_event.is_set():
-            return
-        self.cancel_event.set()
-        self.cancel_button.configure(state="disabled")
-        self.status.set("Cancellation requested; waiting for the current step to finish…")
-
-    def on_close(self):
-        if self.running:
-            if not messagebox.askokcancel(
-                "Merger is running",
-                "Request cancellation and close after the current layer finishes? "
-                "No output file will be written if cancellation completes before saving.",
-                parent=self.root,
-            ):
-                return
-            self.closing = True
-            self.cancel_event.set()
-            self.status.set("Cancellation requested; waiting for the current layer to finish…")
-            self.run_button.configure(state="disabled")
-            return
-        self.closing = True
-        self.root.destroy()
-
-
-def launch_gui():
-    if not HAVE_TK:
-        raise RuntimeError("tkinter is not available in this Python installation. "
-                           "Run the script with command-line arguments instead (see --help).")
-    if HAVE_BOOTSTRAP:
-        root = ttk.Window(themename=DEFAULT_THEME)
-    else:
-        print("Tip: pip install ttkbootstrap for a modern look (using plain ttk for now).", file=sys.stderr)
-        root = tk.Tk()
-    Krea2MergerGUI(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        try:
-            launch_gui()
-        except Exception as exc:
-            print(f"Could not start GUI: {exc}", file=sys.stderr)
-            traceback.print_exc()
-            sys.exit(1)
-    else:
-        # --help and argument errors exit here, before any "press Enter" prompt.
-        cli_args = args_parse()
-        ok = True
-        try:
-            merge_loras(cli_args)
-            print("\nFinished.")
-        except Exception as exc:
-            ok = False
-            print(f"\nERROR: {exc}", file=sys.stderr)
-            traceback.print_exc()
-        if not ok and not cli_args.no_pause and sys.stdin and sys.stdin.isatty():
-            try:
-                input("\nPress Enter to close...")
-            except EOFError:
-                pass
-        sys.exit(0 if ok else 1)
