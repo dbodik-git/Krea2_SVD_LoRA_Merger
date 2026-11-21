@@ -54,7 +54,7 @@ class LoKrConversionTests(unittest.TestCase):
 
     def test_lokr_detection(self):
         self.assertTrue(is_lokr_state_keys(["x.lokr_w1", "x.lokr_w2"]))
-        self.assertFalse(is_lokr_state_keys(["x.lora_down.weight", "x.lora_up.weight"]))
+        self.assertFalse(is_lokr_state_keys(["x.lora_down.weight", "x.lora_up.weight", "x.alpha"]))
 
     def test_decomposed_or_tucker_layout_is_rejected_explicitly(self):
         source = {
