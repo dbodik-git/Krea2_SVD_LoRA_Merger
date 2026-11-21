@@ -19,7 +19,7 @@ _UNSUPPORTED = (
 
 def is_lokr_state_keys(keys):
     """Return True when any tensor key identifies a LoKr layout."""
-    suffixes = (_W1, _W2, _ALPHA) + _UNSUPPORTED
+    suffixes = (_W1, _W2) + _UNSUPPORTED
     return any(isinstance(key, str) and key.endswith(suffixes) for key in keys)
 
 
