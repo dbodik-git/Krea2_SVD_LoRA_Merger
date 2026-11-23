@@ -9,6 +9,8 @@ Typical use: you have three Krea2 LoRAs (a style, a character, a detail LoRA) an
 - **Weighted merge** of any number of LoRAs, with a separate coefficient for each (negative values are allowed).
 - **Uniform output rank** via QR + small-core SVD. Only a small `k x k` matrix goes through SVD, so it is fast even for large layers.
 - **CPU only.** No GPU or VRAM needed.
+- **CPU thread control:** choose 1–20 PyTorch intra-op threads in CLI or GUI; the default is 6. More threads are not automatically faster, so benchmark on the target CPU.
+- **Run diagnostics:** each run reports wall-clock time and start/end/peak sampled process RSS. RSS is process memory, not total system RAM; the 50 ms sampler can miss very brief peaks.
 - **Preflight checks** when you add a file: SafeTensors structure, A/B shapes, key naming, dimension compatibility with the other selected LoRAs. Only headers are read, so this is instant.
 - **Safe by design:**
   - inputs are read-only and can never be chosen as the output;
@@ -34,6 +36,8 @@ python -m pip install -r requirements.txt
 
 The command-line mode works without `tkinter` and `ttkbootstrap`. The included `requirements.txt` pins a full dependency set and includes `ttkbootstrap`; if you only need CLI, install `torch` and `safetensors` compatible with your environment instead. Avoid installing these packages into Forge Neo's Python unless you intentionally want to modify that environment.
 
+The merger sets PyTorch's CPU intra-op thread count from `--cpu-threads` before tensor payloads are loaded. Each run prints elapsed wall time, start/end process working set, the peak observed by a 50 ms sampler, and the operating-system lifetime peak working set when available. On Windows, working set includes both shared and private resident pages, including mapped-file pages; it is not the same as private working set and is not total system RAM. The sampler can miss very short-lived peaks, while the Windows lifetime-peak counter records the process high-water mark.
+
 ## Usage
 
 ### GUI
@@ -46,7 +50,7 @@ python Krea2_SVD_LoRA_Merger.py
 
 1. Click **Add files...** and pick your LoRAs. Each file is checked on the spot; problems are explained in a dialog.
 2. Set a **coefficient** for every LoRA (default `1.0`).
-3. Choose the **output file** (it must end in `.safetensors`), **target rank** and **dtype**.
+3. Choose the **output file** (it must end in `.safetensors`), **target rank**, **dtype** and **CPU threads** (default 6; choose 1–20).
 4. Check the **activation text** field. It is filled automatically from the input LoRAs' JSON files and you can edit it (see [Forge Neo sidecar JSON](#forge-neo-sidecar-json)).
 5. Optionally tick **Dry run** to validate without saving, or untick **Write Forge Neo sidecar JSON** if you do not need it.
 6. Click **Run merger** and watch the log. Click **Cancel** to stop a running merge (see [Cancelling](#cancelling)).
@@ -72,6 +76,7 @@ On Windows `cmd`, put it on one line or use `^` instead of `\`.
 | `--output` | example path in the script | Output file (must end in `.safetensors`) |
 | `--weights` | `1.0` for every input | One coefficient per input |
 | `--target-rank` | `32` | Rank of the merged LoRA |
+| `--cpu-threads` | `6` | PyTorch CPU intra-op threads (1–20); more threads may be slower on some CPUs |
 | `--dtype` | `bf16` | Output dtype: `bf16`, `fp16` or `fp32` |
 | `--dry-run` | off | Validate everything, write nothing |
 | `--overwrite` | off | Allow replacing an existing output file and its sidecar JSON (the old JSON is kept as `.json.bak`) |
@@ -137,6 +142,7 @@ The reported per-layer metric is the relative Frobenius norm of the discarded si
 ## Supported LoRA formats
 
 - Key styles: `lora_down` / `lora_up` (kohya-style) and `lora_A` / `lora_B` (PEFT/diffusers-style, including `.default`).
+- **LoKr input conversion:** direct full-matrix `lokr_w1` + `lokr_w2` pairs are converted internally to Kohya-style LoRA factors; the output then follows the same SVD merge path as ordinary LoRAs.
 - Alpha keys: `.alpha` or `.lora_alpha`. Missing alpha is treated as `alpha = rank` (scale 1).
 - Linear (2D) layers only.
 - Layer names must match between LoRAs to be summed. A layer that exists in only one LoRA is kept and re-packed on its own.
@@ -144,9 +150,9 @@ The reported per-layer metric is the relative Frobenius norm of the discarded si
 
 ## Limitations and notes
 
-- **Conv (4D) LoRAs, LoKr and LoHa are not supported** and are rejected with an error.
+- **LoKr:** direct full-matrix `lokr_w1` / `lokr_w2` modules are detected automatically and converted to ordinary SVD LoRA at the selected target rank before merging. Conversion uses the factor SVDs and does not materialize the full Kronecker matrix. For direct full-matrix LyCORIS LoKr, alpha is not used as an extra scale; the converted LoRA is written with alpha equal to the target rank. Decomposed LoKr (`lokr_w*_a/b`), Tucker (`lokr_t2`) and LoHa are not supported and are rejected explicitly. Conv (4D) LoRA remains unsupported.
 - **Alpha without tensors:** if a LoRA has no alpha tensors but was trained with `alpha != rank` (the value is then only in `ss_network_alpha` metadata or in a training config), the script assumes scale 1 and prints a warning. Check such files by testing the result.
-- **Memory:** all input LoRAs are loaded into RAM at once, in their stored dtype.
+- **Memory (standard mode):** all input LoRAs are loaded into RAM at once, in their stored dtype. The separate matrix-free mode reads only the current module's source tensors, but the output factors still accumulate in RAM.
 - **Metadata:** the output is labeled `modelspec.architecture = krea2/lora` and `ss_base_model_version = krea2`. Along with it the file records the merge inputs, coefficients, target rank and dtype (`merge_*` keys). Change these in `merge_loras()` if you use the script for another model.
 - Always test a merged LoRA at low strength first; merged deltas can behave differently from stacked LoRAs, especially at high coefficients.
 
@@ -156,8 +162,63 @@ The reported per-layer metric is the relative Frobenius norm of the discarded si
 | --- | --- |
 | `ModuleNotFoundError: tkinter` | Your Python has no Tk. Use the command-line mode, or install Python with Tcl/Tk support. |
 | GUI looks plain | `ttkbootstrap` is not installed: `pip install ttkbootstrap`. |
-| `Unrecognized tensors ...` | The file contains keys that are not LoRA A/B/alpha pairs (for example LoKr/LoHa or extra data). The script stops on purpose rather than dropping data. |
+| `Unrecognized tensors ...` | The file contains unsupported or mixed tensor keys (for example LoHa, decomposed/Tucker LoKr, or extra data). Supported full-matrix LoKr is converted automatically. The script stops rather than dropping unknown data. |
 | `Dimension mismatch ...` | The LoRAs were trained for different base models or architectures. |
 | `fp16 overflow at ...` | Use `bf16` or `fp32` as the output dtype. |
 | `Output exists ...` | Pick another file name or pass `--overwrite` (or tick the checkbox in the GUI). |
 
+
+
+## Matrix-free joint LoKr + LoRA SVD (approximate)
+
+The separate **Matrix-free joint SVD** mode combines direct-matrix LoKr terms and
+ordinary LoRA terms through an implicit linear operator. It does not construct
+the Kronecker matrix or expand LoKr into full-rank A/B factors. Modules are
+processed one at a time, so input payloads are not all retained in RAM together.
+
+This mode uses randomized SVD and is therefore approximate. Its reported
+relative residual is estimated with random probe vectors; it is not the exact
+Frobenius truncation error reported by the standard QR/SVD path. Negative merge
+coefficients are supported for both LoKr and ordinary LoRA contributions.
+
+CLI example:
+
+~~~bash
+python Krea2_SVD_LoRA_Merger.py --inputs lokr.safetensors style.safetensors ^
+  --weights 1.0 -0.35 --output merged_matrix_free.safetensors ^
+  --target-rank 32 --lokr-matrix-free --lokr-svd-oversample 8 ^
+  --lokr-svd-power-iterations 2 --lokr-workspace-max-gb 2.0
+~~~
+
+The GUI has a separate checkbox for this mode. It cannot be combined with
+**Preserve full LoKr rank until the final SVD**. The workspace preflight is a
+conservative algorithm-workspace estimate only: it excludes input tensor
+payloads, output tensors, and Python/PyTorch runtime memory. Keep the limit
+conservative on systems with 16 GB RAM. Start with the default oversampling and
+power-iteration settings; increasing them raises runtime and memory use.
+
+The matrix-free mode currently supports the same direct full-matrix LoKr
+layout as the existing converter (lokr_w1 + lokr_w2) and ordinary 2D LoRA
+A/B pairs. Decomposed/Tucker LoKr, LoHa, and convolutional factors remain
+unsupported.
+
+## Exact LoKr preservation (single final SVD)
+
+The optional **Preserve full LoKr rank until the final SVD** mode avoids the
+intermediate rank truncation used by the default LoKr converter. Direct
+full-matrix LoKr factors are expanded into exact ordinary A/B factors, then
+combined with the other selected LoRAs and compressed once by the normal
+joint QR + small-core SVD stage.
+
+This mode can use substantially more RAM. Before loading tensor payloads, the
+merger estimates the float32 A/B factor storage from the SafeTensors headers.
+The GUI uses a conservative 2 GiB estimate limit. CLI example:
+
+```bash
+python Krea2_SVD_LoRA_Merger.py --inputs lokr_a.safetensors lokr_b.safetensors ordinary.safetensors --output merged_fullrank.safetensors --target-rank 32 --lokr-full-rank --lokr-max-factor-gb 2.0
+```
+
+The estimate covers expanded LoKr A/B factors, not every temporary tensor or
+the Python/PyTorch runtime. Keep the limit conservative on systems with 16 GB
+RAM; do not raise it unless sufficient physical memory is available. The
+default mode remains the lower-memory per-LoKr rank conversion.

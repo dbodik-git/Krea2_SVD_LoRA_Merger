@@ -1,10 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """Krea2 SVD LoRA Merger v4: CPU merge, QR + small-core SVD, atomic save."""
-import argparse, json, math, os, shutil, sys, tempfile, traceback, contextlib, io, struct
+import argparse, json, math, os, shutil, sys, tempfile, traceback, contextlib, io, struct, time
 import threading
+import queue
 from collections import Counter, defaultdict
 from pathlib import Path
+from lokr_to_svd_lora import (is_lokr_state_keys, inspect_lokr_header,
+                              convert_lokr_state_dict)
+from matrix_free_lokr import (LoKrTerm, LoRATerm, MatrixFreeSum,
+                              randomized_joint_svd, estimate_workspace_bytes)
 
 # GUI dependencies are optional: the command-line mode works without tkinter.
 # The GUI uses ttkbootstrap (pip install ttkbootstrap) and falls back to plain ttk without it.
@@ -51,6 +56,20 @@ def args_parse():
     p.add_argument("--weights", nargs="+", type=float, default=None,
                    help="one coefficient per input (default: 1.0 for every input)")
     p.add_argument("--target-rank", type=int, default=32)
+    p.add_argument("--cpu-threads", type=int, choices=range(1, 21), default=6,
+                   help="PyTorch CPU intra-op threads (default: 6; configurable range: 1-20)")
+    p.add_argument("--lokr-full-rank", action="store_true",
+                   help="preserve exact LoKr factor rank until the single final merge SVD")
+    p.add_argument("--lokr-max-factor-gb", type=float, default=2.0,
+                   help="RAM preflight limit for expanded full-rank LoKr A/B factors (default: 2 GB)")
+    p.add_argument("--lokr-matrix-free", action="store_true",
+                   help="use matrix-free joint SVD for mixed LoKr + LoRA without expanding Kronecker factors")
+    p.add_argument("--lokr-svd-oversample", type=int, default=8,
+                   help="randomized SVD oversampling (default: 8)")
+    p.add_argument("--lokr-svd-power-iterations", type=int, default=2,
+                   help="randomized SVD power iterations (default: 2)")
+    p.add_argument("--lokr-workspace-max-gb", type=float, default=2.0,
+                   help="preflight limit for matrix-free algorithm workspace (default: 2 GB)")
     p.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--overwrite", action="store_true")
@@ -109,6 +128,9 @@ def inspect_lora_header(path):
         if not all(isinstance(x, int) for x in offsets) or offsets[0] < 0 or offsets[1] < offsets[0] or 8 + n + offsets[1] > size:
             raise ValueError(f"Incorrect data_offsets: {key}")
         tensors[key] = {"shape": tuple(shape), "dtype": dtype}
+
+    if is_lokr_state_keys(tensors):
+        return inspect_lokr_header(path, metadata, tensors)
 
     mods, unknown = defaultdict(dict), []
     for key, info in tensors.items():
@@ -197,8 +219,12 @@ def parse_key(key):
     return None
 
 
-def load_lora(path, torch, load_file):
+def load_lora(path, torch, load_file, target_rank, lokr_full_rank=False):
     raw = load_file(str(path), device="cpu")
+    if is_lokr_state_keys(raw):
+        raw = convert_lokr_state_dict(
+            raw, torch, None if lokr_full_rank else target_rank, source_name=path.name
+        )
     mods, unknown = defaultdict(dict), []
     for key, tensor in raw.items():
         parsed = parse_key(key)
@@ -354,7 +380,354 @@ def write_forge_user_metadata(output_path, metadata, overwrite=False):
     print(f"Forge Neo user metadata JSON: {json_path}")
 
 
-def merge_loras(args=None):
+
+
+def _process_working_set_bytes():
+    """Return (current working set, OS lifetime peak working set) in bytes."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(counters)
+            kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi.dll", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+                wintypes.DWORD,
+            ]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            if psapi.GetProcessMemoryInfo(
+                kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+            ):
+                return (
+                    int(counters.WorkingSetSize),
+                    int(counters.PeakWorkingSetSize),
+                )
+        except Exception:
+            pass
+
+    # Optional dependency fallback; does not affect the merge if unavailable.
+    try:
+        import os
+        import psutil
+
+        info = psutil.Process(os.getpid()).memory_info()
+        peak = getattr(info, "peak_wset", None)
+        return int(info.rss), (int(peak) if peak else None)
+    except Exception:
+        pass
+
+    # Linux fallback without requiring psutil.
+    if sys.platform.startswith("linux"):
+        try:
+            import os
+            import resource
+
+            with open("/proc/self/statm", "r", encoding="ascii") as file:
+                resident_pages = int(file.read().split()[1])
+            current = resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+            peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+            return current, peak
+        except Exception:
+            pass
+    return None, None
+
+
+class _ProcessMemoryMonitor:
+    """Sample process RSS during one merge; samples do not retain tensor payloads."""
+    def __init__(self, interval=0.05):
+        self.interval = float(interval)
+        self.start_rss = None
+        self.current_rss = None
+        self.peak_sampled_rss = None
+        self.peak_os_working_set = None
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def _sample(self):
+        rss, os_peak = _process_working_set_bytes()
+        if rss is not None:
+            self.current_rss = rss
+            if self.peak_sampled_rss is None or rss > self.peak_sampled_rss:
+                self.peak_sampled_rss = rss
+        if os_peak is not None:
+            if self.peak_os_working_set is None or os_peak > self.peak_os_working_set:
+                self.peak_os_working_set = os_peak
+
+    def _run(self):
+        while not self._stop_event.wait(self.interval):
+            self._sample()
+
+    def start(self):
+        self._sample()
+        self.start_rss = self.current_rss
+        self._thread = threading.Thread(
+            target=self._run, name="MergerMemoryMonitor", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._sample()
+
+
+def _print_run_diagnostics(status, elapsed_seconds, cpu_threads, monitor):
+    """Print end-of-run timing and process-RSS diagnostics."""
+    print()
+    print("Run diagnostics")
+    print(f"  Result: {status}")
+    print(f"  Elapsed wall time: {elapsed_seconds:.2f} s")
+    print(f"  PyTorch CPU intra-op threads: {cpu_threads}")
+    mib = 1024 ** 2
+    if monitor.start_rss is not None:
+        print(f"  Process RSS at start: {monitor.start_rss / mib:.1f} MiB")
+    else:
+        print("  Process RSS at start: unavailable")
+    if monitor.current_rss is not None:
+        print(f"  Process RSS at end: {monitor.current_rss / mib:.1f} MiB")
+    else:
+        print("  Process RSS at end: unavailable")
+    if monitor.peak_sampled_rss is not None:
+        peak_mib = monitor.peak_sampled_rss / mib
+        print(f"  Peak sampled process working set: {peak_mib:.1f} MiB")
+        if monitor.start_rss is not None:
+            growth = max(0, monitor.peak_sampled_rss - monitor.start_rss)
+            print(f"  Peak working-set increase over run start: {growth / mib:.1f} MiB")
+    else:
+        print("  Peak sampled process working set: unavailable")
+    if monitor.peak_os_working_set is not None:
+        print(f"  OS-reported lifetime peak working set: "
+              f"{monitor.peak_os_working_set / mib:.1f} MiB")
+    else:
+        print("  OS-reported lifetime peak working set: unavailable")
+    print("  Working set includes shared and private resident pages, including mapped-file pages.")
+    print("  This is process memory, not total system RAM; sampled peak uses a 50 ms interval.")
+
+
+def merge_loras_matrix_free(args, torch, safe_open, load_file, save_file,
+                            inputs, output, write_json, output_json, check_cancel):
+    """Merge one module at a time through an implicit LoKr/LoRA operator."""
+    if bool(getattr(args, "lokr_full_rank", False)):
+        raise ValueError("--lokr-matrix-free and --lokr-full-rank are separate modes; choose only one.")
+    oversample = int(getattr(args, "lokr_svd_oversample", 8))
+    power_iterations = int(getattr(args, "lokr_svd_power_iterations", 2))
+    workspace_limit_gb = float(getattr(args, "lokr_workspace_max_gb", 2.0))
+    if oversample < 0 or power_iterations < 0:
+        raise ValueError("Matrix-free oversample and power iterations must be non-negative.")
+    if not math.isfinite(workspace_limit_gb) or workspace_limit_gb <= 0:
+        raise ValueError("--lokr-workspace-max-gb must be finite and greater than zero.")
+
+    infos = [inspect_lora_header(p) for p in inputs]
+    for path, info in zip(inputs, infos):
+        if info.get("format") == "lokr":
+            continue
+        no_alpha_ranks = {
+            int(mod["A"]["shape"][0]) for mod in info["modules"].values()
+            if "alpha_suffix" not in mod
+        }
+        metadata_alpha = info.get("metadata", {}).get("ss_network_alpha")
+        if no_alpha_ranks and metadata_alpha is not None:
+            try:
+                metadata_alpha = float(metadata_alpha)
+            except (TypeError, ValueError):
+                metadata_alpha = None
+            if metadata_alpha is not None and any(
+                abs(metadata_alpha - rank) > 1e-9 for rank in no_alpha_ranks
+            ):
+                print(
+                    f"WARNING: {path.name} has LoRA modules without alpha tensors; "
+                    f"scale 1 (alpha = rank) is assumed, but metadata says "
+                    f"ss_network_alpha={metadata_alpha:g}."
+                )
+    for i in range(len(infos)):
+        for j in range(i + 1, len(infos)):
+            compare_lora_headers(infos[i], [infos[j]])
+    stems = sorted(set().union(*(set(info["modules"]) for info in infos)))
+    if not stems:
+        raise ValueError("No compatible LoRA modules were found.")
+
+    max_workspace = 0
+    max_workspace_stem = None
+    for stem in stems:
+        first = next(info["modules"][stem] for info in infos if stem in info["modules"])
+        shape = (first["B"]["shape"][0], first["A"]["shape"][1])
+        required = estimate_workspace_bytes(
+            shape, args.target_rank, oversample=oversample, safety_factor=2.5
+        )
+        if required > max_workspace:
+            max_workspace, max_workspace_stem = required, stem
+    limit_bytes = workspace_limit_gb * (1024 ** 3)
+    print("Matrix-free LoKr/LoRA joint SVD mode")
+    print(f"Workspace preflight: largest estimated algorithm workspace "
+          f"{max_workspace / (1024 ** 3):.3f} GiB at {max_workspace_stem}; "
+          f"configured limit {workspace_limit_gb:.2f} GiB.")
+    print("Estimate excludes source tensor payloads, output tensors and Python/PyTorch runtime.")
+    if max_workspace > limit_bytes:
+        raise MemoryError(
+            "Matrix-free SVD stopped before loading tensor payloads: estimated workspace "
+            f"{max_workspace / (1024 ** 3):.3f} GiB exceeds the configured "
+            f"{workspace_limit_gb:.2f} GiB limit."
+        )
+
+    activation_override = getattr(args, "activation_text", None)
+    forge_metadata = (build_forge_user_metadata(inputs, activation_text=activation_override)
+                      if write_json else None)
+    if args.dry_run:
+        print(f"DRY RUN: validated {len(inputs)} inputs and {len(stems)} modules.")
+        if forge_metadata is not None:
+            print(f"Forge Neo JSON that would be written: {output_json}")
+            print(json.dumps(forge_metadata, indent=4, ensure_ascii=False))
+        print("No tensor payloads loaded; no output written.")
+        return
+
+    dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    if args.dtype not in dtypes:
+        raise ValueError(f"Unsupported output dtype: {args.dtype}")
+    output_dtype = dtypes[args.dtype]
+    out, errors, ranks = {}, [], set()
+    # Keep file handles open, but only load tensors for the current module.
+    with contextlib.ExitStack() as stack:
+        handles = [
+            stack.enter_context(safe_open(str(path), framework="pt", device="cpu"))
+            for path in inputs
+        ]
+        for index, stem in enumerate(stems, 1):
+            check_cancel()
+            lokr_terms, lora_terms = [], []
+            present_infos = []
+            for file_index, (info, handle, weight) in enumerate(zip(infos, handles, args.weights)):
+                mod = info["modules"].get(stem)
+                if mod is None:
+                    continue
+                present_infos.append((info, mod))
+                if info.get("format") == "lokr":
+                    w1 = handle.get_tensor(stem + ".lokr_w1")
+                    w2 = handle.get_tensor(stem + ".lokr_w2")
+                    lokr_terms.append(LoKrTerm(w1, w2, weight=float(weight)))
+                else:
+                    A = handle.get_tensor(stem + mod["A_suffix"])
+                    B = handle.get_tensor(stem + mod["B_suffix"])
+                    rank = int(A.shape[0])
+                    if "alpha_suffix" in mod:
+                        alpha_tensor = handle.get_tensor(stem + mod["alpha_suffix"]).float().reshape(-1)
+                        if alpha_tensor.numel() != 1 or not torch.isfinite(alpha_tensor).all():
+                            raise ValueError(f"Invalid alpha tensor at {stem} in {inputs[file_index].name}.")
+                        alpha = float(alpha_tensor[0].item())
+                    else:
+                        alpha = float(rank)
+                    lora_terms.append(LoRATerm(A, B, scale=alpha / rank, weight=float(weight)))
+
+            operator = MatrixFreeSum(torch, lokr_terms=lokr_terms, lora_terms=lora_terms)
+            Aout, Bout, error_estimate, core_rank = randomized_joint_svd(
+                operator, args.target_rank, oversample=oversample,
+                power_iterations=power_iterations, seed=1729 + index,
+                error_probes=8,
+            )
+            if not torch.isfinite(Aout).all() or not torch.isfinite(Bout).all():
+                raise FloatingPointError(f"Non-finite matrix-free factor at {stem}.")
+            Aout = Aout.to(output_dtype).contiguous()
+            Bout = Bout.to(output_dtype).contiguous()
+            if not torch.isfinite(Aout.float()).all() or not torch.isfinite(Bout.float()).all():
+                raise FloatingPointError(f"{args.dtype} overflow at {stem}; try bf16 or fp32.")
+
+            first_info, first_mod = present_infos[0]
+            if first_info.get("format") == "lokr":
+                a_suffix, b_suffix = ".lora_down.weight", ".lora_up.weight"
+            else:
+                a_suffix, b_suffix = first_mod["A_suffix"], first_mod["B_suffix"]
+            alpha_suffix = next(
+                (mod["alpha_suffix"] for _info, mod in present_infos if "alpha_suffix" in mod),
+                ".alpha" if any(info.get("format") == "lokr" for info, _mod in present_infos) else None,
+            )
+            a_key, b_key = stem + a_suffix, stem + b_suffix
+            if a_key in out or b_key in out:
+                raise ValueError(f"Output key collision at {stem}.")
+            out[a_key], out[b_key] = Aout, Bout
+            if alpha_suffix:
+                out[stem + alpha_suffix] = torch.tensor(float(args.target_rank), dtype=torch.float32)
+            ranks.add(int(Aout.shape[0]))
+            errors.append((error_estimate, stem, core_rank))
+            if index % 10 == 0 or index == len(stems):
+                print(f"  matrix-free modules {index}/{len(stems)}")
+
+    mean_error = sum(item[0] for item in errors) / max(1, len(errors))
+    max_error = max((item[0] for item in errors), default=0.0)
+    print(f"Random-probe relative residual estimate: mean={mean_error:.6g}; max={max_error:.6g}")
+    print("This is a randomized estimate, not an exact Frobenius truncation error.")
+    for error, stem, core_rank in sorted(errors, reverse=True)[:10]:
+        print(f"  estimated residual {error:.6g} (projected rank {core_rank}) {stem}")
+
+    metadata = {
+        "format": "pt", "modelspec.architecture": "krea2/lora",
+        "ss_base_model_version": "krea2", "ss_network_dim": str(args.target_rank),
+        "ss_network_alpha": str(args.target_rank), "ss_output_name": output.stem,
+        "modelspec.title": output.stem, "merge_method": "matrix_free_randomized_joint_svd",
+        "merge_input_files": json.dumps([p.name for p in inputs], ensure_ascii=False),
+        "merge_weights": json.dumps(args.weights), "merge_target_rank": str(args.target_rank),
+        "merge_output_dtype": args.dtype,
+        "merge_error_metric": "random_probe_relative_residual_estimate",
+        "merge_svd_oversample": str(oversample),
+        "merge_svd_power_iterations": str(power_iterations),
+    }
+    check_cancel()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temp = None
+    try:
+        fd, name = tempfile.mkstemp(prefix=output.name + ".", suffix=".tmp.safetensors",
+                                    dir=str(output.parent))
+        os.close(fd)
+        temp = Path(name)
+        save_file(out, str(temp), metadata=metadata)
+        check = load_file(str(temp), device="cpu")
+        if set(check) != set(out):
+            raise RuntimeError("Serialized keys differ from in-memory keys.")
+        for key, tensor in check.items():
+            if tuple(tensor.shape) != tuple(out[key].shape):
+                raise RuntimeError(f"Serialized shape mismatch: {key}")
+            if not torch.isfinite(tensor.float()).all():
+                raise RuntimeError(f"Non-finite serialized tensor: {key}")
+        if output.exists() and not args.overwrite:
+            raise FileExistsError(f"Output appeared during processing: {output}")
+        os.replace(str(temp), str(output))
+        temp = None
+    finally:
+        if temp is not None:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    print(f"SUCCESS: {output}")
+    print(f"Output tensors: {len(out)}; factor ranks: {sorted(ranks)}")
+    print("Saved file was reopened and validated before atomic replacement.")
+    if forge_metadata is None:
+        print("Forge Neo JSON skipped (--no-forge-json).")
+    else:
+        try:
+            write_forge_user_metadata(output, forge_metadata, overwrite=args.overwrite)
+        except Exception as exc:
+            print(f"WARNING: LoRA saved, but Forge Neo JSON could not be written: {exc}")
+
+def _merge_loras_impl(args=None):
     if args is None:
         args = args_parse()
     if not args.inputs: raise ValueError("At least one input is required.")
@@ -362,8 +735,18 @@ def merge_loras(args=None):
         args.weights = [1.0] * len(args.inputs)
     if len(args.weights) != len(args.inputs): raise ValueError("Supply exactly one --weights value per input.")
     if args.target_rank < 1: raise ValueError("--target-rank must be >= 1.")
+    lokr_max_factor_gb = float(getattr(args, "lokr_max_factor_gb", 2.0))
+    if not math.isfinite(lokr_max_factor_gb) or lokr_max_factor_gb <= 0:
+        raise ValueError("--lokr-max-factor-gb must be a finite value greater than zero.")
     if not all(math.isfinite(w) for w in args.weights): raise ValueError("Weights must be finite.")
     import torch
+    cpu_threads = int(getattr(args, "cpu_threads", 6))
+    if not 1 <= cpu_threads <= 20:
+        raise ValueError("--cpu-threads must be between 1 and 20.")
+    # Match the benchmarked PyTorch CPU intra-op setting. Do this before
+    # loading tensor payloads or running any eager tensor operations.
+    torch.set_num_threads(cpu_threads)
+    print(f"PyTorch CPU intra-op threads: {torch.get_num_threads()}")
     from safetensors import safe_open
     from safetensors.torch import load_file, save_file
     inputs = [Path(x).expanduser() for x in args.inputs]
@@ -377,6 +760,7 @@ def merge_loras(args=None):
             raise InterruptedError("Merge cancelled by user. No output file was written.")
 
     if output.resolve() in {p.resolve() for p in inputs}: raise ValueError("Output cannot overwrite an input.")
+
     missing = [str(p) for p in inputs if not p.is_file()]
     if missing: raise FileNotFoundError("Missing input(s):\n  " + "\n  ".join(missing))
     # A dry run never writes anything, so an existing output file is not a problem there.
@@ -389,15 +773,44 @@ def merge_loras(args=None):
             raise ValueError("The output Forge JSON would overwrite an input LoRA's JSON file; choose another output name.")
         if output_json.exists() and not args.overwrite and not args.dry_run:
             raise FileExistsError(f"Forge metadata JSON exists: {output_json}. Choose another output or pass --overwrite.")
+
+    if bool(getattr(args, "lokr_matrix_free", False)):
+        if bool(getattr(args, "lokr_full_rank", False)):
+            raise ValueError("--lokr-matrix-free and --lokr-full-rank are mutually exclusive.")
+        print("Krea2 SVD LoRA Merger")
+        print(f"Target rank={args.target_rank}; dtype={args.dtype}; sources remain read-only.")
+        for p, w in zip(inputs, args.weights):
+            print(f"  {p.name}  coefficient={w:g}")
+        print(f"Output: {output}\n")
+        merge_loras_matrix_free(
+            args, torch, safe_open, load_file, save_file, inputs, output,
+            write_json, output_json, check_cancel
+        )
+        return
     print("Krea2 SVD LoRA Merger")
     print(f"Target rank={args.target_rank}; dtype={args.dtype}; sources remain read-only.")
+    lokr_full_rank = bool(getattr(args, "lokr_full_rank", False))
+    if lokr_full_rank:
+        infos = [inspect_lora_header(p) for p in inputs]
+        estimated = sum(info.get("lokr_full_rank_factor_bytes", 0) for info in infos)
+        limit_bytes = lokr_max_factor_gb * (1024 ** 3)
+        print(f"LoKr exact-factor preflight: estimated A/B storage={estimated / (1024 ** 3):.2f} GiB; "
+              f"configured limit={limit_bytes / (1024 ** 3):.2f} GiB.")
+        if estimated > limit_bytes:
+            raise MemoryError(
+                "Full-rank LoKr expansion was stopped before loading tensor payloads: "
+                f"estimated A/B factors need {estimated / (1024 ** 3):.2f} GiB, "
+                f"above the configured {limit_bytes / (1024 ** 3):.2f} GiB limit. "
+                "Increase --lokr-max-factor-gb only if sufficient physical RAM is available."
+            )
+        print("LoKr mode: preserve full factor rank; only the final joint SVD will truncate.")
     for p, w in zip(inputs, args.weights): print(f"  {p.name}  coefficient={w:g}")
     print(f"Output: {output}\n")
     allmods = []
     for p in inputs:
         check_cancel()
         with safe_open(str(p), framework="pt", device="cpu") as sf: md = sf.metadata() or {}
-        mods = load_lora(p, torch, load_file)
+        mods = load_lora(p, torch, load_file, args.target_rank, lokr_full_rank=lokr_full_rank)
         allmods.append(mods)
         print(f"Read {p.name}: {len(mods)} modules; architecture={md.get('modelspec.architecture','unspecified')}; base={md.get('ss_base_model_version','unspecified')}")
         # Without alpha tensors the scale is assumed to be 1 (alpha = rank). Warn if metadata disagrees.
@@ -513,6 +926,26 @@ def merge_loras(args=None):
             print(f"  WARNING: The LoRA was saved, but the Forge Neo JSON could not be written: {exc}")
 
 
+
+def merge_loras(args=None):
+    """Run the merger with end-to-end timing and lightweight RSS sampling."""
+    if args is None:
+        args = args_parse()
+    cpu_threads = int(getattr(args, "cpu_threads", 6))
+    monitor = _ProcessMemoryMonitor(interval=0.05)
+    started = time.perf_counter()
+    status = "failed"
+    monitor.start()
+    try:
+        result = _merge_loras_impl(args)
+        status = "completed"
+        return result
+    finally:
+        elapsed = time.perf_counter() - started
+        monitor.stop()
+        _print_run_diagnostics(status, elapsed, cpu_threads, monitor)
+
+
 class _GuiStream(io.TextIOBase):
     """File-like object that forwards everything written to it (print output) to a callback."""
     def __init__(self, emit):
@@ -542,6 +975,9 @@ class Krea2MergerGUI:
         self.header_infos = []
         self.output_file = tk.StringVar()
         self.target_rank = tk.StringVar(value="32")
+        self.cpu_threads = tk.StringVar(value="6")
+        self.lokr_full_rank = tk.BooleanVar(value=False)
+        self.lokr_matrix_free = tk.BooleanVar(value=False)
         self.dtype = tk.StringVar(value="bf16")
         self.overwrite = tk.BooleanVar(value=False)
         self.dry_run = tk.BooleanVar(value=False)
@@ -551,9 +987,13 @@ class Krea2MergerGUI:
         self.running = False
         self.closing = False
         self.cancel_event = threading.Event()
+        # The worker thread never touches Tk: it only puts items into this queue,
+        # and the main thread drains it from _poll_queue().
+        self.msg_queue = queue.Queue()
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(50, self._poll_queue)
 
     def _build_ui(self):
         outer = ttk.Frame(self.root, padding=12)
@@ -602,6 +1042,12 @@ class Krea2MergerGUI:
         ttk.Label(row, text="Output dtype:").pack(side=tk.LEFT)
         ttk.Combobox(row, textvariable=self.dtype, values=("bf16", "fp16", "fp32"),
                      state="readonly", width=8).pack(side=tk.LEFT, padx=6)
+        ttk.Label(row, text="CPU threads:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Spinbox(row, from_=1, to=20, textvariable=self.cpu_threads, width=5).pack(side=tk.LEFT, padx=6)
+        ttk.Checkbutton(settings, text="Preserve full LoKr rank until the final SVD (RAM intensive; preflight limit 2 GiB)",
+                        variable=self.lokr_full_rank).pack(anchor="w")
+        ttk.Checkbutton(settings, text="Matrix-free joint SVD for LoKr + LoRA (approximate; avoids Kronecker expansion)",
+                        variable=self.lokr_matrix_free).pack(anchor="w")
         ttk.Checkbutton(settings, text="Allow overwriting existing output", variable=self.overwrite).pack(anchor="w")
         ttk.Checkbutton(settings, text="Dry run (validate only; do not save)", variable=self.dry_run).pack(anchor="w")
         ttk.Checkbutton(settings, text="Write Forge Neo sidecar JSON next to the output",
@@ -688,10 +1134,21 @@ class Krea2MergerGUI:
     def append_log(self, text):
         self.append_raw(text if text.endswith("\n") else text + "\n")
 
-    def _post(self, func, *a):
-        """Schedule callbacks on the Tk main thread; ignore errors after destruction."""
+    def _poll_queue(self):
+        """Main-thread pump: apply log text and completion events from the worker."""
         try:
-            self.root.after(0, func, *a)
+            while True:
+                item = self.msg_queue.get_nowait()
+                if item[0] == "log":
+                    self.append_raw(item[1])
+                elif item[0] == "done":
+                    self.finish_run(item[1], item[2])
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return  # window destroyed
+        try:
+            self.root.after(50, self._poll_queue)
         except (tk.TclError, RuntimeError):
             pass
 
@@ -854,12 +1311,21 @@ class Krea2MergerGUI:
             raise ValueError(f"Forge metadata JSON already exists:\n{output_json}\n\n"
                              "Choose another name, enable overwrite, or untick the Forge JSON option.")
 
+        if self.lokr_full_rank.get() and self.lokr_matrix_free.get():
+            raise ValueError("\"Preserve full LoKr rank\" and \"Matrix-free joint SVD\" "
+                             "are mutually exclusive; untick one of them.")
         try:
             rank = int(self.target_rank.get())
         except (ValueError, tk.TclError):
             raise ValueError("Target rank must be a whole number.")
         if rank < 1:
             raise ValueError("Target rank must be at least 1.")
+        try:
+            cpu_threads = int(self.cpu_threads.get())
+        except (ValueError, tk.TclError):
+            raise ValueError("CPU threads must be a whole number from 1 to 20.")
+        if not 1 <= cpu_threads <= 20:
+            raise ValueError("CPU threads must be between 1 and 20.")
         try:
             weights = [float(v.get()) for v in self.weight_vars]
         except (ValueError, tk.TclError):
@@ -878,6 +1344,13 @@ class Krea2MergerGUI:
             output=str(output),
             weights=weights,
             target_rank=rank,
+            cpu_threads=cpu_threads,
+            lokr_full_rank=self.lokr_full_rank.get(),
+            lokr_matrix_free=self.lokr_matrix_free.get(),
+            lokr_svd_oversample=8,
+            lokr_svd_power_iterations=2,
+            lokr_workspace_max_gb=2.0,
+            lokr_max_factor_gb=2.0,
             dtype=self.dtype.get(),
             dry_run=self.dry_run.get(),
             overwrite=self.overwrite.get(),
@@ -903,20 +1376,21 @@ class Krea2MergerGUI:
         self.progress.start(12)
         self.append_log("\n" + "=" * 70)
         self.append_log("Running merger directly inside this application (no subprocess).")
-        self.append_log(f"Inputs: {len(args.inputs)}; rank={args.target_rank}; dtype={args.dtype}; dry_run={args.dry_run}")
+        self.append_log(f"Inputs: {len(args.inputs)}; rank={args.target_rank}; dtype={args.dtype}; "
+                        f"CPU threads={args.cpu_threads}; dry_run={args.dry_run}")
         threading.Thread(target=self.run_worker, args=(args,), daemon=True).start()
 
     def run_worker(self, args):
         # Output is streamed to the log window line by line while the merge runs.
-        stream = _GuiStream(lambda s: self._post(self.append_raw, s))
+        stream = _GuiStream(lambda s: self.msg_queue.put(("log", s)))
         try:
             with contextlib.redirect_stdout(stream):
                 merge_loras(args)
-            self._post(self.finish_run, 0, "")
+            self.msg_queue.put(("done", 0, ""))
         except InterruptedError:
-            self._post(self.finish_run, 2, "\nMerge cancelled. No output file was written.")
+            self.msg_queue.put(("done", 2, "\nMerge cancelled. No output file was written."))
         except Exception:
-            self._post(self.finish_run, 1, "\n--- ERROR ---\n" + traceback.format_exc())
+            self.msg_queue.put(("done", 1, "\n--- ERROR ---\n" + traceback.format_exc()))
 
     def finish_run(self, returncode, extra):
         self.running = False
