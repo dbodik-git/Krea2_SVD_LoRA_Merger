@@ -7,7 +7,7 @@ import queue
 from collections import Counter, defaultdict
 from pathlib import Path
 from lokr_to_svd_lora import (is_lokr_state_keys, inspect_lokr_header,
-                              convert_lokr_state_dict)
+                              convert_lokr_state_dict, lokr_alpha_message)
 from matrix_free_lokr import (LoKrTerm, LoRATerm, MatrixFreeSum,
                               randomized_joint_svd, estimate_workspace_bytes)
 
@@ -204,7 +204,8 @@ def compare_lora_headers(new_info, existing_infos):
         aa, ab = ma.get("modelspec.architecture"), mb.get("modelspec.architecture")
         ba = ma.get("ss_base_model_version") or ma.get("ss_base_model")
         bb = mb.get("ss_base_model_version") or mb.get("ss_base_model")
-        if aa and ab and aa != ab:
+        # "krea2/lokr" vs "krea2/lora" is the same model family, not a real mismatch.
+        if aa and ab and str(aa).lower().replace("lokr", "lora") != str(ab).lower().replace("lokr", "lora"):
             warnings.append(f"Architecture differs from {old['path'].name}: {aa} / {ab}.")
         if ba and bb and ba != bb:
             warnings.append(f"Base model differs from {old['path'].name}: {ba} / {bb}.")
@@ -219,11 +220,13 @@ def parse_key(key):
     return None
 
 
-def load_lora(path, torch, load_file, target_rank, lokr_full_rank=False):
+def load_lora(path, torch, load_file, target_rank, lokr_full_rank=False, metadata=None):
     raw = load_file(str(path), device="cpu")
-    if is_lokr_state_keys(raw):
+    from_lokr = is_lokr_state_keys(raw)
+    if from_lokr:
         raw = convert_lokr_state_dict(
-            raw, torch, None if lokr_full_rank else target_rank, source_name=path.name
+            raw, torch, None if lokr_full_rank else target_rank,
+            source_name=path.name, metadata=metadata
         )
     mods, unknown = defaultdict(dict), []
     for key, tensor in raw.items():
@@ -250,6 +253,7 @@ def load_lora(path, torch, load_file, target_rank, lokr_full_rank=False):
         else:
             m["alpha_value"] = float(A.shape[0])
         m["rank"] = int(A.shape[0])
+        m["from_lokr"] = from_lokr
     return mods
 
 
@@ -272,6 +276,61 @@ def repack(A_cat, B_cat, target_rank, torch):
     norm = torch.linalg.vector_norm(S)
     err = 0.0 if float(norm.item()) == 0 else float((torch.linalg.vector_norm(S[k:]) / norm).item())
     return Aout, Bout, err, int(S.numel())
+
+
+def _pick_output_style(candidates):
+    """Choose output key suffixes once, the same way for every module.
+
+    candidates: iterable of (is_lokr, module_dict). The first ordinary LoRA wins, so a
+    PEFT-style (lora_A/lora_B) input is never silently turned into kohya-style just
+    because a LoKr file was listed first. With only LoKr inputs, kohya names are used.
+    Returns (a_suffix, b_suffix, alpha_suffix_or_None).
+    """
+    candidates = list(candidates)
+    ordinary = next((mod for is_lokr, mod in candidates if not is_lokr), None)
+    if ordinary is None:
+        return ".lora_down.weight", ".lora_up.weight", ".alpha"
+    return ordinary["A_suffix"], ordinary["B_suffix"], ordinary.get("alpha_suffix")
+
+
+def _output_identity_metadata(input_metadatas):
+    """modelspec.architecture / ss_base_model_version for the output.
+
+    Taken from the inputs when they all agree; otherwise the Krea2 defaults are used.
+    An architecture string that mentions LoKr is not copied to an ordinary LoRA output.
+    """
+    defaults = {"modelspec.architecture": "krea2/lora", "ss_base_model_version": "krea2"}
+    arch = {md.get("modelspec.architecture") for md in input_metadatas if md.get("modelspec.architecture")}
+    base = {md.get("ss_base_model_version") or md.get("ss_base_model")
+            for md in input_metadatas if md.get("ss_base_model_version") or md.get("ss_base_model")}
+    result = dict(defaults)
+    if len(arch) == 1:
+        value = next(iter(arch))
+        if "lokr" not in str(value).lower():
+            result["modelspec.architecture"] = str(value)
+    elif len(arch) > 1:
+        print(f"NOTE: inputs disagree on modelspec.architecture {sorted(map(str, arch))}; "
+              f"writing default {defaults['modelspec.architecture']}.")
+    if len(base) == 1:
+        result["ss_base_model_version"] = str(next(iter(base)))
+    elif len(base) > 1:
+        print(f"NOTE: inputs disagree on base model {sorted(map(str, base))}; "
+              f"writing default {defaults['ss_base_model_version']}.")
+    return result
+
+
+def _warn_alpha_metadata(name, no_alpha_ranks, metadata):
+    """Warn if alpha-less modules assume scale 1 but metadata says otherwise."""
+    meta_alpha = (metadata or {}).get("ss_network_alpha")
+    if not no_alpha_ranks or meta_alpha is None:
+        return
+    try:
+        meta_alpha = float(meta_alpha)
+    except (TypeError, ValueError):
+        return
+    if any(abs(meta_alpha - r) > 1e-9 for r in no_alpha_ranks):
+        print(f"  WARNING: {name} has no alpha tensors, so scale 1 (alpha = rank) is assumed, "
+              f"but metadata says ss_network_alpha={meta_alpha:g}. The contribution may be scaled incorrectly.")
 
 
 FORGE_USER_METADATA_KEYS = (
@@ -559,6 +618,21 @@ def merge_loras_matrix_free(args, torch, safe_open, load_file, save_file,
                     f"scale 1 (alpha = rank) is assumed, but metadata says "
                     f"ss_network_alpha={metadata_alpha:g}."
                 )
+    for path, info in zip(inputs, infos):
+        if info.get("format") != "lokr":
+            continue
+        alpha_stems = [stem for stem, mod in info["modules"].items() if mod.get("has_alpha")]
+        if not alpha_stems:
+            continue
+        alpha_values = []
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            for stem in alpha_stems:  # scalars only: negligible memory
+                tensor = handle.get_tensor(stem + ".alpha").float().reshape(-1)
+                if tensor.numel() == 1 and torch.isfinite(tensor).all():
+                    alpha_values.append(float(tensor[0].item()))
+        message = lokr_alpha_message(path.name, alpha_values, info.get("metadata"))
+        if message:
+            print(message)
     for i in range(len(infos)):
         for j in range(i + 1, len(infos)):
             compare_lora_headers(infos[i], [infos[j]])
@@ -650,14 +724,8 @@ def merge_loras_matrix_free(args, torch, safe_open, load_file, save_file,
             if not torch.isfinite(Aout.float()).all() or not torch.isfinite(Bout.float()).all():
                 raise FloatingPointError(f"{args.dtype} overflow at {stem}; try bf16 or fp32.")
 
-            first_info, first_mod = present_infos[0]
-            if first_info.get("format") == "lokr":
-                a_suffix, b_suffix = ".lora_down.weight", ".lora_up.weight"
-            else:
-                a_suffix, b_suffix = first_mod["A_suffix"], first_mod["B_suffix"]
-            alpha_suffix = next(
-                (mod["alpha_suffix"] for _info, mod in present_infos if "alpha_suffix" in mod),
-                ".alpha" if any(info.get("format") == "lokr" for info, _mod in present_infos) else None,
+            a_suffix, b_suffix, alpha_suffix = _pick_output_style(
+                (info.get("format") == "lokr", mod) for info, mod in present_infos
             )
             a_key, b_key = stem + a_suffix, stem + b_suffix
             if a_key in out or b_key in out:
@@ -678,8 +746,8 @@ def merge_loras_matrix_free(args, torch, safe_open, load_file, save_file,
         print(f"  estimated residual {error:.6g} (projected rank {core_rank}) {stem}")
 
     metadata = {
-        "format": "pt", "modelspec.architecture": "krea2/lora",
-        "ss_base_model_version": "krea2", "ss_network_dim": str(args.target_rank),
+        "format": "pt", **_output_identity_metadata([info["metadata"] for info in infos]),
+        "ss_network_dim": str(args.target_rank),
         "ss_network_alpha": str(args.target_rank), "ss_output_name": output.stem,
         "modelspec.title": output.stem, "merge_method": "matrix_free_randomized_joint_svd",
         "merge_input_files": json.dumps([p.name for p in inputs], ensure_ascii=False),
@@ -806,24 +874,49 @@ def _merge_loras_impl(args=None):
         print("LoKr mode: preserve full factor rank; only the final joint SVD will truncate.")
     for p, w in zip(inputs, args.weights): print(f"  {p.name}  coefficient={w:g}")
     print(f"Output: {output}\n")
+    if args.dry_run:
+        # Header-only validation: no tensor payloads are read and no LoKr is converted.
+        infos = [inspect_lora_header(p) for p in inputs]
+        for p, info in zip(inputs, infos):
+            check_cancel()
+            md = info["metadata"]
+            print(f"Checked {p.name}: {info['module_count']} modules; format={info.get('format', 'lora')}; "
+                  f"architecture={md.get('modelspec.architecture', 'unspecified')}; "
+                  f"base={md.get('ss_base_model_version', 'unspecified')}")
+            if info.get("format") != "lokr":
+                _warn_alpha_metadata(
+                    p.name,
+                    {int(m["A"]["shape"][0]) for m in info["modules"].values() if "alpha_suffix" not in m},
+                    md)
+        for i in range(len(infos)):
+            for j in range(i + 1, len(infos)):
+                for warning in compare_lora_headers(infos[j], [infos[i]]):
+                    print(f"  WARNING: {warning}")
+                left, right = set(infos[i]["modules"]), set(infos[j]["modules"])
+                print(f"Overlap {inputs[i].name} <-> {inputs[j].name}: {len(left & right)} shared; "
+                      f"{len(left - right)} left-only; {len(right - left)} right-only")
+        union = set().union(*(set(info["modules"]) for info in infos))
+        print(f"\nUnion: {len(union)} module stems; all detected shapes compatible.")
+        activation_override = getattr(args, "activation_text", None)
+        forge_metadata = (build_forge_user_metadata(inputs, activation_text=activation_override)
+                          if write_json else None)
+        if forge_metadata is not None:
+            print(f"\nForge Neo JSON that would be written: {output_json}")
+            print(json.dumps(forge_metadata, indent=4, ensure_ascii=False))
+        print("DRY RUN complete (headers only; no tensor payloads loaded). No output written.")
+        return
     allmods = []
+    input_metadata = []
     for p in inputs:
         check_cancel()
         with safe_open(str(p), framework="pt", device="cpu") as sf: md = sf.metadata() or {}
-        mods = load_lora(p, torch, load_file, args.target_rank, lokr_full_rank=lokr_full_rank)
+        input_metadata.append(md)
+        mods = load_lora(p, torch, load_file, args.target_rank, lokr_full_rank=lokr_full_rank, metadata=md)
         allmods.append(mods)
         print(f"Read {p.name}: {len(mods)} modules; architecture={md.get('modelspec.architecture','unspecified')}; base={md.get('ss_base_model_version','unspecified')}")
         # Without alpha tensors the scale is assumed to be 1 (alpha = rank). Warn if metadata disagrees.
         no_alpha_ranks = {m["rank"] for m in mods.values() if "alpha" not in m}
-        meta_alpha = md.get("ss_network_alpha")
-        if no_alpha_ranks and meta_alpha is not None:
-            try:
-                meta_alpha = float(meta_alpha)
-            except (TypeError, ValueError):
-                meta_alpha = None
-            if meta_alpha is not None and any(abs(meta_alpha - r) > 1e-9 for r in no_alpha_ranks):
-                print(f"  WARNING: {p.name} has no alpha tensors, so scale 1 (alpha = rank) is assumed, "
-                      f"but metadata says ss_network_alpha={meta_alpha:g}. The contribution may be scaled incorrectly.")
+        _warn_alpha_metadata(p.name, no_alpha_ranks, md)
     for i in range(len(inputs)):
         for j in range(i+1, len(inputs)):
             left, right = set(allmods[i]), set(allmods[j])
@@ -840,11 +933,6 @@ def _merge_loras_impl(args=None):
     activation_override = getattr(args, "activation_text", None)
     forge_metadata = (build_forge_user_metadata(inputs, activation_text=activation_override)
                       if write_json else None)
-    if args.dry_run:
-        if forge_metadata is not None:
-            print(f"\nForge Neo JSON that would be written: {output_json}")
-            print(json.dumps(forge_metadata, indent=4, ensure_ascii=False))
-        print("DRY RUN complete. No output written."); return
     dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtypes[args.dtype]
     out, errs, ranks = {}, [], set()
@@ -864,12 +952,12 @@ def _merge_loras_impl(args=None):
         An, Bn = An.to(dtype).contiguous(), Bn.to(dtype).contiguous()
         if not torch.isfinite(An.float()).all() or not torch.isfinite(Bn.float()).all():
             raise FloatingPointError(f"{args.dtype} overflow at {stem}; try bf16 or fp32.")
-        # Preserve first encountered A/B suffix style and alpha-key style for this module.
-        first = next(e for e in entries if e is not None)
-        ak, bk = stem + first["A_suffix"], stem + first["B_suffix"]
+        # Same key style for every module: first ordinary LoRA wins, LoKr only if no LoRA is present.
+        a_suffix, b_suffix, alpha_suffix = _pick_output_style(
+            (e["from_lokr"], e) for e in entries if e is not None)
+        ak, bk = stem + a_suffix, stem + b_suffix
         if ak in out or bk in out: raise ValueError(f"Output key collision: {stem}")
         out[ak], out[bk] = An, Bn
-        alpha_suffix = next((e["alpha_suffix"] for e in entries if e is not None and "alpha" in e), None)
         if alpha_suffix: out[stem + alpha_suffix] = torch.tensor(float(args.target_rank), dtype=torch.float32)
         ranks.add(int(An.shape[0])); errs.append((err, stem, core_rank))
         if n % 25 == 0 or n == len(stems): print(f"  processed {n}/{len(stems)}")
@@ -880,8 +968,8 @@ def _merge_loras_impl(args=None):
     for err, stem, k in sorted(errs, reverse=True)[:10]: print(f"  {err:.6g} (core rank {k}) {stem}")
     print("This metric excludes final dtype quantization error.")
     metadata = {
-        "format": "pt", "modelspec.architecture": "krea2/lora",
-        "ss_base_model_version": "krea2", "ss_network_dim": str(args.target_rank),
+        "format": "pt", **_output_identity_metadata(input_metadata),
+        "ss_network_dim": str(args.target_rank),
         "ss_network_alpha": str(args.target_rank), "ss_output_name": output.stem,
         "modelspec.title": output.stem, "merge_method": "weighted_delta_sum_qr_small_core_svd",
         "merge_input_files": json.dumps([p.name for p in inputs], ensure_ascii=False),

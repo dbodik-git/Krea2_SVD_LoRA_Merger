@@ -99,6 +99,7 @@ def inspect_lokr_header(path, metadata, tensors):
             "B": {"shape": (out_dim, 1), "dtype": w2["dtype"]},
             "A_suffix": ".lora_down.weight",
             "B_suffix": ".lora_up.weight",
+            "has_alpha": "alpha" in pair,
         }
         dtypes.update((w1["dtype"], w2["dtype"]))
     notes = [
@@ -152,10 +153,41 @@ def _kronecker_svd(w1, w2, target_rank, torch, stem):
     right = (v1s.unsqueeze(1) * v2s.unsqueeze(0)).reshape(in_dim, k)
     B[:, :k] = left * roots.unsqueeze(0)
     A[:k, :] = (right * roots.unsqueeze(0)).T
-    return B.contiguous(), A.contiguous(), k, int(flat.numel())
+    # Frobenius norm of kron(w1, w2) is sqrt(sum(flat**2)), so the relative error of
+    # the rank-k truncation is known exactly without building the full matrix.
+    total_energy = float((flat.double() ** 2).sum().item())
+    kept_energy = float((values.double() ** 2).sum().item())
+    rel_error = 0.0 if total_energy <= 0 else math.sqrt(max(0.0, total_energy - kept_energy) / total_energy)
+    return B.contiguous(), A.contiguous(), k, int(flat.numel()), rel_error
 
 
-def convert_lokr_state_dict(state_dict, torch, target_rank, source_name="<LoKr>"):
+def lokr_alpha_message(source_name, alpha_values, metadata=None):
+    """Warning text if LoKr alpha values cannot be explained by the LyCORIS convention.
+
+    For full-matrix LoKr, LyCORIS saves alpha equal to the configured dim and applies
+    scale 1, so alpha == ss_network_dim is the expected, silent case.
+    """
+    values = sorted({round(float(v), 6) for v in alpha_values})
+    if not values:
+        return None
+    dim = None
+    if metadata:
+        try:
+            dim = float(metadata.get("ss_network_dim"))
+        except (TypeError, ValueError):
+            dim = None
+    if dim is not None and all(abs(v - dim) < 1e-6 for v in values):
+        return None
+    shown = ", ".join(f"{v:g}" for v in values[:4]) + (", ..." if len(values) > 4 else "")
+    ref = (f"metadata ss_network_dim={dim:g}" if dim is not None
+           else "no ss_network_dim metadata to compare with")
+    return (f"WARNING: {source_name} stores LoKr alpha values ({shown}; {ref}). Alpha is ignored: "
+            "full-matrix LoKr is applied as kron(w1, w2) with scale 1 (LyCORIS convention). "
+            "If this file came from a trainer that scales full LoKr by alpha/rank, its contribution "
+            "will be off by that factor; compensate with the merge weight.")
+
+
+def convert_lokr_state_dict(state_dict, torch, target_rank, source_name="<LoKr>", metadata=None):
     """Convert direct-matrix LoKr tensors to standard Kohya-style LoRA tensors.
 
     With an integer target_rank, the update is truncated during conversion.
@@ -167,6 +199,7 @@ def convert_lokr_state_dict(state_dict, torch, target_rank, source_name="<LoKr>"
         raise ValueError("LoKr conversion target rank must be >= 1.")
     groups = _group_lokr(state_dict)
     converted = {}
+    alpha_values, trunc_errors = [], []
     total_modules = len(groups)
     mode = "exact full rank (no intermediate truncation)" if target_rank is None else f"rank {target_rank}"
     print(
@@ -184,10 +217,23 @@ def convert_lokr_state_dict(state_dict, torch, target_rank, source_name="<LoKr>"
             alpha = pair["alpha"].float().reshape(-1)
             if alpha.numel() != 1 or not torch.isfinite(alpha).all():
                 raise ValueError(f"{source_name}: invalid LoKr alpha at {stem}.")
-        B, A, _, _ = _kronecker_svd(w1, w2, target_rank, torch, stem)
+            alpha_values.append(float(alpha[0].item()))
+        B, A, _, _, rel_error = _kronecker_svd(w1, w2, target_rank, torch, stem)
+        trunc_errors.append((rel_error, stem))
         converted[stem + ".lora_down.weight"] = A
         converted[stem + ".lora_up.weight"] = B
         converted[stem + ".alpha"] = torch.tensor(float(A.shape[0]), dtype=torch.float32)
         if index % 25 == 0 or index == total_modules:
             print(f"    converted {index}/{total_modules} LoKr modules")
+    message = lokr_alpha_message(source_name, alpha_values, metadata)
+    if message:
+        print("  " + message)
+    if target_rank is not None and trunc_errors:
+        mean_err = sum(e for e, _ in trunc_errors) / len(trunc_errors)
+        worst_err, worst_stem = max(trunc_errors)
+        print(f"  LoKr -> rank {target_rank} truncation (applied BEFORE merging): "
+              f"relative error mean={mean_err:.4g}, max={worst_err:.4g} ({worst_stem})")
+        if worst_err > 0.01:
+            print("  NOTE: this loss is on top of the final merge truncation. Use --lokr-full-rank "
+                  "or --lokr-matrix-free to truncate only once.")
     return converted
