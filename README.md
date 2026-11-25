@@ -10,7 +10,7 @@ Typical use: you have three Krea2 LoRAs (a style, a character, a detail LoRA) an
 - **Uniform output rank** via QR + small-core SVD. Only a small `k x k` matrix goes through SVD, so it is fast even for large layers.
 - **CPU only.** No GPU or VRAM needed.
 - **CPU thread control:** choose 1–20 PyTorch intra-op threads in CLI or GUI; the default is 6. More threads are not automatically faster, so benchmark on the target CPU.
-- **Run diagnostics:** each run reports wall-clock time and start/end/peak sampled process RSS. RSS is process memory, not total system RAM; the 50 ms sampler can miss very brief peaks.
+- **Run diagnostics:** each run reports elapsed time, start/end working set, the peak observed by a 50 ms sampler, and the OS-reported lifetime peak working set when available. Working set includes shared and private resident pages (including mapped-file pages); it is process memory, not total system RAM. The sampler can miss brief peaks.
 - **Preflight checks** when you add a file: SafeTensors structure, A/B shapes, key naming, dimension compatibility with the other selected LoRAs. Only headers are read, so this is instant.
 - **Safe by design:**
   - inputs are read-only and can never be chosen as the output;
@@ -77,6 +77,12 @@ On Windows `cmd`, put it on one line or use `^` instead of `\`.
 | `--weights` | `1.0` for every input | One coefficient per input |
 | `--target-rank` | `32` | Rank of the merged LoRA |
 | `--cpu-threads` | `6` | PyTorch CPU intra-op threads (1–20); more threads may be slower on some CPUs |
+| `--lokr-full-rank` | off | Preserve the exact full LoKr factor rank until the final merge SVD (higher RAM use) |
+| `--lokr-max-factor-gb` | `2.0` | Preflight limit in GiB for expanded full-rank LoKr A/B factors |
+| `--lokr-matrix-free` | off | Use approximate matrix-free randomized joint SVD for LoKr + LoRA |
+| `--lokr-svd-oversample` | `8` | Randomized SVD oversampling |
+| `--lokr-svd-power-iterations` | `2` | Randomized SVD power iterations |
+| `--lokr-workspace-max-gb` | `2.0` | Preflight limit in GiB for matrix-free algorithm workspace |
 | `--dtype` | `bf16` | Output dtype: `bf16`, `fp16` or `fp32` |
 | `--dry-run` | off | Validate everything, write nothing |
 | `--overwrite` | off | Allow replacing an existing output file and its sidecar JSON (the old JSON is kept as `.json.bak`) |
@@ -146,14 +152,14 @@ The reported per-layer metric is the relative Frobenius norm of the discarded si
 - Alpha keys: `.alpha` or `.lora_alpha`. Missing alpha is treated as `alpha = rank` (scale 1).
 - Linear (2D) layers only.
 - Layer names must match between LoRAs to be summed. A layer that exists in only one LoRA is kept and re-packed on its own.
-- The output reuses the key style of the first LoRA that contains the layer.
+- **One output key style for the whole file:** when ordinary LoRAs use different Kohya/PEFT suffix styles, the merger selects the most common style across all ordinary-LoRA modules (ties are resolved deterministically). The choice is made globally, so the output does not mix key styles and does not depend on input-file order. With LoKr-only inputs, Kohya-style keys are used.
 
 ## Limitations and notes
 
 - **LoKr:** direct full-matrix `lokr_w1` / `lokr_w2` modules are detected automatically and converted to ordinary SVD LoRA at the selected target rank before merging. Conversion uses the factor SVDs and does not materialize the full Kronecker matrix. For direct full-matrix LyCORIS LoKr, alpha is not used as an extra scale; the converted LoRA is written with alpha equal to the target rank. Decomposed LoKr (`lokr_w*_a/b`), Tucker (`lokr_t2`) and LoHa are not supported and are rejected explicitly. Conv (4D) LoRA remains unsupported.
-- **Alpha without tensors:** if a LoRA has no alpha tensors but was trained with `alpha != rank` (the value is then only in `ss_network_alpha` metadata or in a training config), the script assumes scale 1 and prints a warning. Check such files by testing the result.
+- **LoKr alpha semantics:** for direct full-matrix LoKr (`lokr_w1` + `lokr_w2`), the implementation applies `kron(w1, w2)` with scale 1; it reads and validates stored alpha but does not multiply by `alpha/rank`. This matches the documented LyCORIS full-matrix convention, but the trainer used for an arbitrary LoKr file may differ. The program therefore prints an explicit **UNVERIFIED** note about producer semantics. If that trainer scales full-matrix LoKr by `alpha/rank`, compensate with the corresponding merge coefficient. An alpha value matching `ss_network_dim` is consistent with the LyCORIS convention, but is not proof of the file's provenance.
 - **Memory (standard mode):** all input LoRAs are loaded into RAM at once, in their stored dtype. The separate matrix-free mode reads only the current module's source tensors, but the output factors still accumulate in RAM.
-- **Metadata:** the output is labeled `modelspec.architecture = krea2/lora` and `ss_base_model_version = krea2`. Along with it the file records the merge inputs, coefficients, target rank and dtype (`merge_*` keys). Change these in `merge_loras()` if you use the script for another model.
+- **Metadata:** when all inputs agree, the output preserves their compatible `modelspec.architecture` and base-model identity. Otherwise it falls back to `krea2/lora` and `krea2`. LoKr architecture labels are not copied to an ordinary LoRA output. The file also records the merge inputs, coefficients, target rank, dtype and error metric (`merge_*` keys).
 - Always test a merged LoRA at low strength first; merged deltas can behave differently from stacked LoRAs, especially at high coefficients.
 
 ## Troubleshooting
@@ -201,6 +207,44 @@ The matrix-free mode currently supports the same direct full-matrix LoKr
 layout as the existing converter (lokr_w1 + lokr_w2) and ordinary 2D LoRA
 A/B pairs. Decomposed/Tucker LoKr, LoHa, and convolutional factors remain
 unsupported.
+
+
+## LoKr merge modes and error interpretation
+
+The merger offers three ways to handle direct full-matrix LoKr together with ordinary LoRA:
+
+| Mode | What happens | Rank truncation | Error information |
+| --- | --- | --- | --- |
+| Default | Each LoKr module is converted to ordinary A/B factors at the target rank, then all inputs are merged. | Two stages for LoKr: conversion, then final merge. | Exact conversion-stage LoKr truncation diagnostics, final-stage truncation error, and (when mathematically possible) a conservative upper bound for the combined error. |
+| `--lokr-full-rank` | LoKr is converted to exact full-rank A/B factors before the joint merge. | One final merge truncation. | The final QR/SVD discarded-singular-value metric is exact for the represented sum. |
+| `--lokr-matrix-free` | LoKr and LoRA are combined as an implicit linear operator; no full Kronecker matrix or expanded full-rank LoKr A/B factors are materialized. | One randomized joint approximation. | Random-probe relative residual estimate; approximate, not a formal bound or exact Frobenius error. |
+
+The two explicit modes are mutually exclusive. The GUI can suggest/enable matrix-free mode after detecting a LoKr input; the user can decline or change the option. The full-rank mode is available as a separate checkbox and CLI option.
+
+### Reading the error diagnostics
+
+- **Default mode:** the final QR/SVD truncation metric is measured against the already-converted intermediate sum. It does not, by itself, include the earlier LoKr conversion loss. The merger also reports the conversion-stage loss and attempts to calculate a triangle-inequality **upper bound** for the total error relative to the exact weighted input sum. That bound can be loose; if its denominator cannot be shown to be positive, no bound is reported.
+- **Full-rank mode:** there is no intermediate LoKr truncation, so the final discarded-singular-value metric covers the single truncation of the represented weighted sum (but not output-dtype quantization).
+- **Matrix-free mode:** the reported residual is estimated using random probe vectors and includes randomized approximation plus truncation effects. It is a diagnostic estimate, not a formal upper bound and not guaranteed to equal the optimal rank-k error.
+- A warning threshold such as 0.01 is a diagnostic hint, not a universal pass/fail quality standard.
+
+### LoKr alpha: implementation convention and uncertainty
+
+For direct full-matrix LoKr, the code forms the Kronecker update from `lokr_w1` and `lokr_w2` with scale 1. Alpha tensors are checked and recorded for diagnostics, but are not applied as an additional `alpha/rank` multiplier. This follows the LyCORIS full-matrix convention described in the source notes.
+
+However, the exact trainer that produced a particular LoKr file may be unknown. Files with no alpha tensors (common in some PEFT-style exports) do not reveal the producer's intended scale in the SafeTensors file alone. The merger prints an **UNVERIFIED** note for this reason. If independent evidence shows that a producer applies `alpha/rank` to full-matrix LoKr, adjust that input's merge coefficient accordingly. Do not assume that every LoKr trainer uses the same convention.
+
+### Memory and repeatability
+
+- Standard/default mode loads all selected LoRA payloads into RAM.
+- Matrix-free mode reads source tensors one module at a time, but output factors still accumulate in RAM. Its workspace preflight estimates algorithm workspace only; it excludes source payloads, output tensors, and Python/PyTorch runtime memory.
+- Full-rank mode estimates the float32 storage needed for expanded LoKr A/B factors before loading payloads. This estimate does not include every temporary allocation or runtime overhead.
+- Matrix-free randomized SVD uses a deterministic per-module seed derived from the module name, making the random stream stable across runs and input ordering for a given module. Floating-point/library differences can still affect bitwise reproducibility.
+- The output key suffix style is selected once for the whole file using the most common ordinary-LoRA style, with deterministic tie-breaking. This prevents mixed key styles and makes the choice independent of input ordering.
+
+## Building a standalone Windows executable
+
+See [BUILD_EXE.md](BUILD_EXE.md) for the PyInstaller one-file Windows build instructions, environment requirements, output location, and smoke-test checklist. The executable bundles the application and its dependencies; it does not include LoRA models or user data.
 
 ## Exact LoKr preservation (single final SVD)
 
