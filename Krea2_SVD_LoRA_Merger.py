@@ -4,10 +4,12 @@
 import argparse, json, math, os, shutil, sys, tempfile, traceback, contextlib, io, struct, time
 import threading
 import queue
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 from lokr_to_svd_lora import (is_lokr_state_keys, inspect_lokr_header,
-                              convert_lokr_state_dict, lokr_alpha_message)
+                              convert_lokr_state_dict, lokr_alpha_message,
+                              lokr_semantics_note, LOKR_ALPHA_STATUS)
 from matrix_free_lokr import (LoKrTerm, LoRATerm, MatrixFreeSum,
                               randomized_joint_svd, estimate_workspace_bytes)
 
@@ -220,13 +222,14 @@ def parse_key(key):
     return None
 
 
-def load_lora(path, torch, load_file, target_rank, lokr_full_rank=False, metadata=None):
+def load_lora(path, torch, load_file, target_rank, lokr_full_rank=False, metadata=None,
+              stage1_report=None):
     raw = load_file(str(path), device="cpu")
     from_lokr = is_lokr_state_keys(raw)
     if from_lokr:
         raw = convert_lokr_state_dict(
             raw, torch, None if lokr_full_rank else target_rank,
-            source_name=path.name, metadata=metadata
+            source_name=path.name, metadata=metadata, stage1_report=stage1_report
         )
     mods, unknown = defaultdict(dict), []
     for key, tensor in raw.items():
@@ -276,6 +279,80 @@ def repack(A_cat, B_cat, target_rank, torch):
     norm = torch.linalg.vector_norm(S)
     err = 0.0 if float(norm.item()) == 0 else float((torch.linalg.vector_norm(S[k:]) / norm).item())
     return Aout, Bout, err, int(S.numel())
+
+
+def repack_ex(A_cat, B_cat, target_rank, torch):
+    """Like repack() but also returns norms: (A, B, rel_err, core_rank, total_norm, tail_norm).
+
+    rel_err is relative to the *input* of the repack (the already-truncated sum when
+    LoKr was converted first), so it does not include earlier truncation stages.
+    """
+    A, B = A_cat.float(), B_cat.float()
+    Qb, Rb = torch.linalg.qr(B, mode="reduced")
+    Qa, Ra = torch.linalg.qr(A.T, mode="reduced")
+    U, S, Vh = torch.linalg.svd(Rb @ Ra.T, full_matrices=False)
+    k = min(target_rank, int(S.numel()))
+    root = torch.sqrt(torch.clamp(S[:k], min=0))
+    Bout = B.new_zeros((B.shape[0], target_rank))
+    Aout = A.new_zeros((target_rank, A.shape[1]))
+    if k:
+        Bout[:, :k] = (Qb @ U[:, :k]) * root.unsqueeze(0)
+        Aout[:k, :] = root.unsqueeze(1) * (Vh[:k, :] @ Qa.T)
+    total = float(torch.linalg.vector_norm(S.double()).item())
+    tail = float(torch.linalg.vector_norm(S[k:].double()).item()) if k < S.numel() else 0.0
+    return Aout, Bout, (0.0 if total == 0 else tail / total), int(S.numel()), total, tail
+
+
+def combined_error_bound(stage1_abs_errors, weights, total_norm, tail_norm):
+    """Rigorous upper bound on ||M - final||_F / ||M||_F, or None if not provable.
+
+    M = sum_i w_i M_i, P = sum_i w_i P_i (P_i = truncated LoKr / exact LoRA), final = T(P).
+    ||M - final|| <= ||M - P|| + ||P - final|| <= sum_i |w_i| e_i + tail, and
+    ||M|| >= ||P|| - sum_i |w_i| e_i. Triangle inequality only: usually loose.
+    """
+    e1 = sum(abs(float(w)) * float(e) for w, e in zip(weights, stage1_abs_errors))
+    denom = total_norm - e1
+    if denom <= 0:
+        return None
+    return (e1 + tail_norm) / denom
+
+
+def _pick_global_output_style(candidates):
+    """Choose output key suffixes ONCE for the whole file, independent of input order.
+
+    candidates: iterable of (is_lokr, module_dict) over ALL modules of ALL inputs.
+    Ordinary-LoRA key styles are ranked by module count (desc), then lexicographically,
+    so permuting the input files cannot change the result and no file ends up with
+    mixed key styles. Without any ordinary LoRA, kohya names are used.
+    Returns (a_suffix, b_suffix, alpha_suffix_or_None, note_or_None).
+    """
+    counts, alphas = Counter(), defaultdict(Counter)
+    for is_lokr, mod in candidates:
+        if is_lokr:
+            continue
+        style = (mod["A_suffix"], mod["B_suffix"])
+        counts[style] += 1
+        if mod.get("alpha_suffix"):
+            alphas[style][mod["alpha_suffix"]] += 1
+    if not counts:
+        return ".lora_down.weight", ".lora_up.weight", ".alpha", None
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    style = ranked[0][0]
+    alpha = None
+    if alphas.get(style):
+        alpha = sorted(alphas[style].items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    note = None
+    if len(ranked) > 1:
+        note = ("NOTE: inputs use different key styles "
+                + "; ".join(f"{a}/{b} x{c}" for (a, b), c in ranked)
+                + f". Writing ONE style for every module: {style[0]} / {style[1]}.")
+    return style[0], style[1], alpha, note
+
+
+def _stem_seed(stem, base=1729):
+    """Per-module RNG seed that depends only on the module name (stable across runs,
+    input order and the presence of other modules)."""
+    return (base + zlib.crc32(stem.encode("utf-8"))) & 0x7FFFFFFF
 
 
 def _pick_output_style(candidates):
@@ -388,7 +465,8 @@ def build_forge_user_metadata(input_paths, activation_text=None):
     preferred_weight = sum(weights) / len(weights) if weights else 0.0
     versions = [v.strip() for v in (item.get("sd version") for item in sources)
                 if isinstance(v, str) and v.strip() and v.strip().lower() != "unknown"]
-    sd_version = Counter(versions).most_common(1)[0][0] if versions else FORGE_SD_VERSION_FALLBACK
+    sd_version = (sorted(Counter(versions).items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+                  if versions else FORGE_SD_VERSION_FALLBACK)
     metadata = {
         "description": "Merged LoRA: " + ", ".join(names),
         "sd version": sd_version,
@@ -622,6 +700,7 @@ def merge_loras_matrix_free(args, torch, safe_open, load_file, save_file,
         if info.get("format") != "lokr":
             continue
         alpha_stems = [stem for stem, mod in info["modules"].items() if mod.get("has_alpha")]
+        print(lokr_semantics_note(path.name, len(alpha_stems), len(info["modules"])))
         if not alpha_stems:
             continue
         alpha_values = []
@@ -666,12 +745,20 @@ def merge_loras_matrix_free(args, torch, safe_open, load_file, save_file,
     activation_override = getattr(args, "activation_text", None)
     forge_metadata = (build_forge_user_metadata(inputs, activation_text=activation_override)
                       if write_json else None)
+    g_a, g_b, g_alpha, style_note = _pick_global_output_style(
+        (info.get("format") == "lokr", mod) for info in infos for mod in info["modules"].values())
+    if style_note:
+        print(style_note)
     if args.dry_run:
-        print(f"DRY RUN: validated {len(inputs)} inputs and {len(stems)} modules.")
+        print(f"DRY RUN: validated {len(inputs)} inputs and {len(stems)} modules (headers only).")
+        print(f"Planned merge: matrix-free randomized joint SVD, target rank {args.target_rank}, "
+              f"oversample {oversample}, power iterations {power_iterations}, dtype {args.dtype}; "
+              f"output keys {g_a} / {g_b}" + (f" / {g_alpha}" if g_alpha else "") + ".")
+        print("Header checks do not prove the merge will succeed or fit in RAM.")
         if forge_metadata is not None:
             print(f"Forge Neo JSON that would be written: {output_json}")
             print(json.dumps(forge_metadata, indent=4, ensure_ascii=False))
-        print("No tensor payloads loaded; no output written.")
+        print("No tensor payloads loaded (only scalar LoKr alpha values were read); no output written.")
         return
 
     dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -714,7 +801,7 @@ def merge_loras_matrix_free(args, torch, safe_open, load_file, save_file,
             operator = MatrixFreeSum(torch, lokr_terms=lokr_terms, lora_terms=lora_terms)
             Aout, Bout, error_estimate, core_rank = randomized_joint_svd(
                 operator, args.target_rank, oversample=oversample,
-                power_iterations=power_iterations, seed=1729 + index,
+                power_iterations=power_iterations, seed=_stem_seed(stem),
                 error_probes=8,
             )
             if not torch.isfinite(Aout).all() or not torch.isfinite(Bout).all():
@@ -724,9 +811,7 @@ def merge_loras_matrix_free(args, torch, safe_open, load_file, save_file,
             if not torch.isfinite(Aout.float()).all() or not torch.isfinite(Bout.float()).all():
                 raise FloatingPointError(f"{args.dtype} overflow at {stem}; try bf16 or fp32.")
 
-            a_suffix, b_suffix, alpha_suffix = _pick_output_style(
-                (info.get("format") == "lokr", mod) for info, mod in present_infos
-            )
+            a_suffix, b_suffix, alpha_suffix = g_a, g_b, g_alpha
             a_key, b_key = stem + a_suffix, stem + b_suffix
             if a_key in out or b_key in out:
                 raise ValueError(f"Output key collision at {stem}.")
@@ -754,6 +839,8 @@ def merge_loras_matrix_free(args, torch, safe_open, load_file, save_file,
         "merge_weights": json.dumps(args.weights), "merge_target_rank": str(args.target_rank),
         "merge_output_dtype": args.dtype,
         "merge_error_metric": "random_probe_relative_residual_estimate",
+        **({"merge_lokr_alpha_semantics": LOKR_ALPHA_STATUS}
+           if any(i.get("format") == "lokr" for i in infos) else {}),
         "merge_svd_oversample": str(oversample),
         "merge_svd_power_iterations": str(power_iterations),
     }
@@ -883,6 +970,9 @@ def _merge_loras_impl(args=None):
             print(f"Checked {p.name}: {info['module_count']} modules; format={info.get('format', 'lora')}; "
                   f"architecture={md.get('modelspec.architecture', 'unspecified')}; "
                   f"base={md.get('ss_base_model_version', 'unspecified')}")
+            if info.get("format") == "lokr":
+                print(lokr_semantics_note(p.name, sum(1 for m_ in info["modules"].values() if m_.get("has_alpha")),
+                                          len(info["modules"])))
             if info.get("format") != "lokr":
                 _warn_alpha_metadata(
                     p.name,
@@ -903,15 +993,27 @@ def _merge_loras_impl(args=None):
         if forge_metadata is not None:
             print(f"\nForge Neo JSON that would be written: {output_json}")
             print(json.dumps(forge_metadata, indent=4, ensure_ascii=False))
-        print("DRY RUN complete (headers only; no tensor payloads loaded). No output written.")
+        g_a, g_b, g_alpha, style_note = _pick_global_output_style(
+            (info.get("format") == "lokr", mod) for info in infos for mod in info["modules"].values())
+        if style_note:
+            print(style_note)
+        mode = ("exact LoKr rank kept until the final SVD (--lokr-full-rank)" if lokr_full_rank else
+                f"LoKr -> rank {args.target_rank} -> final rank {args.target_rank} (two truncations; "
+                "see the combined-error line at merge time)")
+        print(f"Planned merge: dense QR + small-core SVD, target rank {args.target_rank}, dtype {args.dtype}; "
+              f"LoKr handling: {mode}; output keys {g_a} / {g_b}" + (f" / {g_alpha}" if g_alpha else "") + ".")
+        print("DRY RUN complete (headers only; no tensor payloads loaded). This does NOT prove the merge "
+              "will succeed or fit in RAM. No output written.")
         return
     allmods = []
     input_metadata = []
+    stage1_reports = {}   # file index -> {stem: absolute LoKr truncation error}
     for p in inputs:
         check_cancel()
         with safe_open(str(p), framework="pt", device="cpu") as sf: md = sf.metadata() or {}
         input_metadata.append(md)
-        mods = load_lora(p, torch, load_file, args.target_rank, lokr_full_rank=lokr_full_rank, metadata=md)
+        mods = load_lora(p, torch, load_file, args.target_rank, lokr_full_rank=lokr_full_rank, metadata=md,
+                         stage1_report=stage1_reports.setdefault(len(allmods), {}))
         allmods.append(mods)
         print(f"Read {p.name}: {len(mods)} modules; architecture={md.get('modelspec.architecture','unspecified')}; base={md.get('ss_base_model_version','unspecified')}")
         # Without alpha tensors the scale is assumed to be 1 (alpha = rank). Warn if metadata disagrees.
@@ -935,26 +1037,31 @@ def _merge_loras_impl(args=None):
                       if write_json else None)
     dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtypes[args.dtype]
-    out, errs, ranks = {}, [], set()
+    out, errs, ranks, bounds = {}, [], set(), []
+    g_a, g_b, g_alpha, style_note = _pick_global_output_style(
+        (e["from_lokr"], e) for m in allmods for e in m.values())
+    if style_note:
+        print(style_note)
     for n, stem in enumerate(stems, 1):
         check_cancel()
         entries = [m.get(stem) for m in allmods]
-        As, Bs = [], []
-        for entry, weight in zip(entries, args.weights):
+        As, Bs, e1s, ws = [], [], [], []
+        for fi, (entry, weight) in enumerate(zip(entries, args.weights)):
             if entry is None: continue
             As.append(entry["A"].float())
             scale = entry["alpha_value"] / entry["rank"] * weight
             Bs.append(entry["B"].float() * scale)
+            e1s.append(stage1_reports.get(fi, {}).get(stem, 0.0)); ws.append(weight)
         Ac, Bc = torch.cat(As, dim=0), torch.cat(Bs, dim=1)
-        An, Bn, err, core_rank = repack(Ac, Bc, args.target_rank, torch)
+        An, Bn, err, core_rank, tot_norm, tail_norm = repack_ex(Ac, Bc, args.target_rank, torch)
+        bounds.append((combined_error_bound(e1s, ws, tot_norm, tail_norm), stem))
         if not torch.isfinite(An).all() or not torch.isfinite(Bn).all():
             raise FloatingPointError(f"Non-finite factor at {stem}")
         An, Bn = An.to(dtype).contiguous(), Bn.to(dtype).contiguous()
         if not torch.isfinite(An.float()).all() or not torch.isfinite(Bn.float()).all():
             raise FloatingPointError(f"{args.dtype} overflow at {stem}; try bf16 or fp32.")
-        # Same key style for every module: first ordinary LoRA wins, LoKr only if no LoRA is present.
-        a_suffix, b_suffix, alpha_suffix = _pick_output_style(
-            (e["from_lokr"], e) for e in entries if e is not None)
+        # One key style for the whole file (chosen once before this loop, input-order independent).
+        a_suffix, b_suffix, alpha_suffix = g_a, g_b, g_alpha
         ak, bk = stem + a_suffix, stem + b_suffix
         if ak in out or bk in out: raise ValueError(f"Output key collision: {stem}")
         out[ak], out[bk] = An, Bn
@@ -966,7 +1073,14 @@ def _merge_loras_impl(args=None):
     print(f"\nRelative Frobenius error from rank truncation only: mean={meanerr:.6g}; max={maxerr:.6g}")
     print("Largest module errors:")
     for err, stem, k in sorted(errs, reverse=True)[:10]: print(f"  {err:.6g} (core rank {k}) {stem}")
-    print("This metric excludes final dtype quantization error.")
+    print("This metric is relative to the (already LoKr-truncated) sum and excludes final dtype quantization error.")
+    if any(any(v > 0 for v in r.values()) for r in stage1_reports.values()):
+        known = [b for b, _ in bounds if b is not None]
+        print(f"Combined error vs the EXACT sum (convert + merge truncation), triangle-inequality UPPER bound: "
+              f"max={max(known):.4g}" if known else "Combined error bound not provable for any module.")
+        if len(known) < len(bounds):
+            print(f"  (no bound for {len(bounds) - len(known)} modules: stage-1 loss >= norm of the sum)")
+        print("  Loose by construction; use --lokr-full-rank or --lokr-matrix-free to remove stage-1 loss.")
     metadata = {
         "format": "pt", **_output_identity_metadata(input_metadata),
         "ss_network_dim": str(args.target_rank),
@@ -976,6 +1090,8 @@ def _merge_loras_impl(args=None):
         "merge_weights": json.dumps(args.weights), "merge_target_rank": str(args.target_rank),
         "merge_output_dtype": args.dtype,
         "merge_error_metric": "relative_frobenius_error_from_rank_truncation_only",
+        **({"merge_lokr_alpha_semantics": LOKR_ALPHA_STATUS}
+           if any(e["from_lokr"] for m_ in allmods for e in m_.values()) else {}),
     }
     check_cancel()  # last point where cancelling is possible; saving and validation are not interrupted
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1051,6 +1167,17 @@ class _GuiStream(io.TextIOBase):
         pass
 
 
+# Which LoKr option the GUI ticks by itself when a LoKr file is added. "matrix_free" keeps a single
+# (approximate) truncation and never expands the Kronecker product; "full_rank" is exact but RAM-heavy.
+AUTO_LOKR_OPTION = "matrix_free"
+
+
+def lokr_detected(header_infos):
+    """Names of inputs whose header says LoKr (is_lokr_state_keys-style detection, headers only)."""
+    return [Path(info["path"]).name if info.get("path") else "?"
+            for info in header_infos if info.get("format") == "lokr"]
+
+
 class Krea2MergerGUI:
     def __init__(self, root):
         self.root = root
@@ -1072,6 +1199,8 @@ class Krea2MergerGUI:
         self.write_json = tk.BooleanVar(value=True)
         self.activation_dirty = False   # True once the user edits the activation text by hand
         self._autofilling = False
+        self._lokr_user_override = False   # user clicked a LoKr checkbox: never touch them again this session
+        self._lokr_auto_set = False        # the current tick was set by the program, not by the user
         self.running = False
         self.closing = False
         self.cancel_event = threading.Event()
@@ -1133,9 +1262,9 @@ class Krea2MergerGUI:
         ttk.Label(row, text="CPU threads:").pack(side=tk.LEFT, padx=(8, 0))
         ttk.Spinbox(row, from_=1, to=20, textvariable=self.cpu_threads, width=5).pack(side=tk.LEFT, padx=6)
         ttk.Checkbutton(settings, text="Preserve full LoKr rank until the final SVD (RAM intensive; preflight limit 2 GiB)",
-                        variable=self.lokr_full_rank).pack(anchor="w")
+                        variable=self.lokr_full_rank, command=self._on_lokr_option_clicked).pack(anchor="w")
         ttk.Checkbutton(settings, text="Matrix-free joint SVD for LoKr + LoRA (approximate; avoids Kronecker expansion)",
-                        variable=self.lokr_matrix_free).pack(anchor="w")
+                        variable=self.lokr_matrix_free, command=self._on_lokr_option_clicked).pack(anchor="w")
         ttk.Checkbutton(settings, text="Allow overwriting existing output", variable=self.overwrite).pack(anchor="w")
         ttk.Checkbutton(settings, text="Dry run (validate only; do not save)", variable=self.dry_run).pack(anchor="w")
         ttk.Checkbutton(settings, text="Write Forge Neo sidecar JSON next to the output",
@@ -1284,11 +1413,58 @@ class Krea2MergerGUI:
         self.refresh_inputs()
         if added:
             self.refresh_activation_text()
+            self._sync_lokr_options()
             self.status.set(f"Added after check: {len(added)}")
         elif not paths:
             return
         elif rejected:
             self.status.set(f"Not added: {len(rejected)}")
+
+    def _on_lokr_option_clicked(self):
+        self._lokr_user_override = True
+        self._lokr_auto_set = False
+
+    def _ask_lokr_confirm(self, names, label):
+        """Ask once whether to tick the LoKr option. Separate method so it can be replaced in tests."""
+        return messagebox.askyesno(
+            "LoKr detected",
+            f"LoKr file detected: {', '.join(names)}\n\n"
+            f"Tick \"{label}\"?\n\n"
+            "Yes: LoKr is truncated only once (approximate, no Kronecker expansion, lower RAM use).\n"
+            "No: the default two-step conversion is used (LoKr -> target rank -> final rank), "
+            "which adds a second truncation whose loss the merge report does not include.\n\n"
+            "You can change this later with the checkboxes. For the exact but RAM-heavy variant, "
+            "tick \"Preserve full LoKr rank\" yourself.",
+            parent=self.root,
+        )
+
+    def _sync_lokr_options(self):
+        """Offer to tick the LoKr option when a LoKr input is present (only after the user agrees).
+
+        Never overrides a manual choice: if the user clicked either LoKr checkbox, declined the offer,
+        or one of the options is already ticked, nothing is changed and nothing is asked. A tick set after
+        consent is cleared again when the last LoKr input is removed."""
+        names = lokr_detected(self.header_infos)
+        var = self.lokr_matrix_free if AUTO_LOKR_OPTION == "matrix_free" else self.lokr_full_rank
+        label = ("Matrix-free joint SVD" if AUTO_LOKR_OPTION == "matrix_free"
+                 else "Preserve full LoKr rank")
+        if names:
+            if (self._lokr_user_override or self._lokr_auto_set
+                    or self.lokr_full_rank.get() or self.lokr_matrix_free.get()):
+                return
+            if self._ask_lokr_confirm(names, label):
+                var.set(True)
+                self._lokr_auto_set = True
+                self.append_log(f"LoKr detected ({', '.join(names)}): '{label}' ticked with your confirmation "
+                                "(LoKr is truncated only once).")
+            else:
+                self._lokr_user_override = True          # declined: do not ask again this session
+                self.append_log(f"LoKr detected ({', '.join(names)}): default two-step conversion kept "
+                                "(adds a second truncation).")
+        elif self._lokr_auto_set:
+            var.set(False)
+            self._lokr_auto_set = False
+            self.append_log("No LoKr inputs left: the LoKr option ticked earlier was cleared.")
 
     def refresh_inputs(self):
         self.input_listbox.delete(0, tk.END)
@@ -1358,6 +1534,7 @@ class Krea2MergerGUI:
         del self.header_infos[i]
         self.refresh_inputs()
         self.refresh_activation_text()
+        self._sync_lokr_options()
 
     def clear_inputs(self):
         self.input_files.clear()
@@ -1365,6 +1542,7 @@ class Krea2MergerGUI:
         self.header_infos.clear()
         self.refresh_inputs()
         self.refresh_activation_text()
+        self._sync_lokr_options()
 
     def browse_output(self):
         path = filedialog.asksaveasfilename(

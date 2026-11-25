@@ -111,6 +111,13 @@ def randomized_joint_svd(operator, rank, oversample=8, power_iterations=2,
 
     Returns (A, B, relative_residual_estimate, projected_rank). The output
     factors are zero-padded to exactly the requested rank.
+
+    The estimate is ||(M - B@A) G||_F / ||M G||_F for a Gaussian probe block G
+    independent of the sketch. Since E||X G||_F^2 = p ||X||_F^2, it estimates the
+    relative Frobenius error of the FINAL factors against the TRUE operator M
+    (randomization error + rank truncation together). It is a noisy estimate
+    (std ~10% of its value at 8 probes in the synthetic tests), not a bound and
+    not the Eckart-Young optimum.
     """
     torch = operator.torch
     m, n = operator.shape
@@ -152,12 +159,16 @@ def randomized_joint_svd(operator, rank, oversample=8, power_iterations=2,
 
 
 def estimate_workspace_bytes(shape, rank, oversample=8, dtype_bytes=4,
-                             safety_factor=2.0):
-    """Conservative algorithm-workspace estimate; excludes source payloads/runtime."""
+                             safety_factor=2.0, error_probes=8):
+    """Heuristic algorithm-workspace estimate; excludes source payloads/runtime.
+
+    Not a guarantee that the process fits in RAM: transient copies (float32
+    casts, einsum intermediates, SVD/QR scratch) are covered only by safety_factor.
+    """
     m, n = map(int, shape)
     rank, oversample, dtype_bytes = int(rank), int(oversample), int(dtype_bytes)
     if min(m, n, rank, dtype_bytes) < 1 or oversample < 0:
         raise ValueError("Invalid dimensions or workspace parameters.")
     width = min(min(m, n), rank + oversample)
-    elements = m * width + n * width + rank * (m + n) + n * 4 + m * 4
+    elements = m * width + n * width + rank * (m + n) + (n + 2 * m) * int(error_probes)
     return int(math.ceil(elements * dtype_bytes * float(safety_factor)))
