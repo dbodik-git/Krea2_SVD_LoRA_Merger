@@ -1,3 +1,4 @@
+
 # Krea2 SVD LoRA Merger
 
 Merge several LoRA files into one and re-pack the result to a uniform rank with SVD. Runs entirely on the CPU, never touches your source files, and comes with a small GUI and a command-line mode.
@@ -21,7 +22,7 @@ Typical use: you have three Krea2 LoRAs (a style, a character, a detail LoRA) an
 - **Forge Neo user metadata JSON:** reads each input LoRA's sidecar `.json`, combines `activation text` and `negative text` phrases (case-insensitive deduplication), averages available `preferred weight` values, and writes a Forge-compatible six-field JSON beside the merged output. Missing input JSON files are skipped. Existing output JSON is protected unless `--overwrite` is enabled.
 - **Modern GUI** built on [ttkbootstrap](https://github.com/israel-dryer/ttkbootstrap) with switchable themes, live log and progress indicator. Falls back to plain `tkinter.ttk` if ttkbootstrap is not installed.
   
-<img width="900" height="997" alt="Screen" src="https://github.com/user-attachments/assets/6782324e-df4e-4ca2-8863-6bacc9e2ea5f" />
+<img width="918" height="1043" alt="Screen-2026-11-25_15-13-31" src="https://github.com/user-attachments/assets/c51c3b02-0705-41dd-9b33-5dab02291963" />
 
 ## Requirements
 
