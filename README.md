@@ -222,3 +222,48 @@ The estimate covers expanded LoKr A/B factors, not every temporary tensor or
 the Python/PyTorch runtime. Keep the limit conservative on systems with 16 GB
 RAM; do not raise it unless sufficient physical memory is available. The
 default mode remains the lower-memory per-LoKr rank conversion.
+
+
+## LoKr Merging Modes
+
+| Mode | Process | Truncations | Error Reporting |
+|---|---|---|---|
+| Default | LoKr → rank `target-rank` → merge → `target-rank` | **Two** | Stage 2 error + upper bound of the total error |
+| `--lokr-full-rank` | LoKr (no truncation) → merge → `target-rank` | One | Exact error (based on discarded singular values) |
+| `--lokr-matrix-free` | Randomized SVD of the sum (without expanding Kronecker products) | One (approximate) | Residual estimate via random sampling |
+
+**GUI.** When adding a LoKr file, the program asks once per session whether to enable the "Matrix-free joint SVD" option (which performs a single truncation). This option is enabled only upon confirmation; declining, or manually clicking either of the two LoKr-related checkboxes, will prevent the prompt from appearing again. If enabled, the option is automatically disabled when the last LoKr file is removed. The `--lokr-full-rank` mode is not offered in the dialog (though it can be enabled manually); the `AUTO_LOKR_OPTION` constant controls which mode is suggested.
+
+### Understanding the Error Values
+
+* **"Relative Frobenius error from rank truncation only"** (dense mode) is calculated relative to the *already truncated* sum. In the default LoKr mode, this value **does not include** the loss incurred during the first stage, resulting in an underestimation of the total error (e.g., 0.244 in a synthetic test, compared to an actual value of 0.279).
+* **"Combined error … UPPER bound"** represents an upper bound for the relative error—defined as `‖exact sum − result‖ / ‖exact sum‖`—derived using the triangle inequality. It is intentionally a rough estimate (based on 200 synthetic tests, the ratio of the bound to the actual value is: min 1.00, median 1.81, max 6.29). If the loss from the first stage is greater than or equal to the sum threshold, the bound cannot be established and is not displayed.
+* The **"Random-probe relative residual estimate"** (matrix-free) approximates the relative Frobenius error of the *resulting factors with respect to the true operator* (accounting for both randomization and truncation). This is a noisy estimate (with a variance of ≈10% using 8 probes); it is neither a formal bound nor the Eckart–Young optimum.
+* The 0.01 threshold mentioned in the warning is merely a diagnostic hint, not a formal quality criterion.
+
+## LoKr alpha semantics — STATUS: NOT FULLY VERIFIED
+
+**How ​​the code functions.** Full-matrix LoKr (`lokr_w1` + `lokr_w2`) is applied as `kron(w1, w2)` with a scale of 1; the `alpha` tensor is read but **not applied**. Decomposed variants (`lokr_w*_a/_b`, `lokr_t2`) are not supported and will trigger an error (as `alpha`/`rank` are significant for these types).
+
+**Basis for this information.**
+
+| No. | Source | Content | Reliability |
+|---|---|---|---|
+| 1 | Copies of `toolkit/models/lokr.py` (from ai-toolkit, Hugging Face Spaces) containing the note "based heavily on LyCORIS commit eb46009…" | `if self.use_w2 and self.use_w1: alpha = lora_dim  # use scale = 1`; followed by `scale = alpha / lora_dim`; `make_kron` then multiplies by `scale` | Derived copy, not the original source | | 2 | Issue shootthesound/Fizgig #304 | References `lycoris/modules/lokr.py`, lines 209–218: contains the same comment, "use scale = 1"; also claims that ComfyUI ignores `alpha` for the full-matrix case. | Secondary account |
+| 3 | PEFT `LoKrLayer.update_layer` | Sets `self.scaling[adapter] = alpha / r` for all LoKr layers; it is **unclear** whether this applies to the full-matrix case. | Incomplete |
+
+**What has NOT been verified:**
+1. The original `KohakuBlueleaf/LyCORIS/lycoris/modules/lokr.py` was not examined directly (the tool could not access the URL), and no actual LyCORIS run was performed.
+2. It is unknown which trainer was used to create the specific Krea2 LoKr file.
+3. Files lacking `alpha` tensors (typical for PEFT) make it impossible to determine the scale intended by the file's creator; the program issues a warning about this whenever a LoKr is used and writes `merge_lokr_alpha_semantics` into the result's metadata.
+
+**How ​​to resolve:** Run `verify_numpy/verify_lokr_alpha_lycoris.py` (requires `pip install lycoris-lora torch`). This script constructs an actual `LokrModule` with full factors and compares its weights against `kron(w1, w2)` and `kron(w1, w2) * alpha/dim`. If the file was created by a trainer that scales full-matrix LoKr by `alpha/rank`, compensate for this by adjusting the merge coefficient (`coefficient *= alpha/rank`). ## Memory
+
+* "Workspace preflight" is an *algorithmic* memory heuristic; it does not guarantee that the process will fit into RAM. It does not account for input tensors, output tensors, the Python/PyTorch runtime, or temporary copies.
+* In "dense" mode, input files are read in their entirety (`load_file`); in "matrix-free" mode, they are read one module at a time. Streaming reads are not implemented for dense mode.
+* `_kronecker_svd` (post-fix): peak memory usage is approximately 1.1–1.5× the size of the output A+B matrices (at full rank), down from ~2.5× (based on measurements from the NumPy port—see report; not measured for the PyTorch implementation).
+
+## Known Limitations
+
+* Merging Kohya and PEFT checkpoints only works if the module names (stems) match. There is no automatic name normalization (e.g., mapping between `lora_unet_…` and `diffusion_model.…`).
+* If an input tensor contains elements on the order of ≤1e-19 (in `float32`), they may be treated as zero during kernel computation; in such cases, the error resulting from a zero norm is reported as `0.0`.
